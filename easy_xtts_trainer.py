@@ -503,8 +503,12 @@ def optimize_model(out_path, base_model_path):
             print(f"Warning: {file} not found in base model path.")
 
     # Remove the run directory and its contents
+    run_dir = Path(out_path) / "run"
     if run_dir.exists():
-        shutil.rmtree(run_dir)
+        try:
+            shutil.rmtree(run_dir)
+        except PermissionError:
+            logging.warning(f"Unable to delete the run directory at {run_dir} due to a permission error. You may want to manually delete this directory to save disk space.")
 
     return f"Model optimized and saved at {optimized_model}!", str(optimized_model)
 
