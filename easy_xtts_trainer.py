@@ -132,7 +132,7 @@ def transcribe_audio(audio_file, args, session_path):
         ]
     else:
         command = [
-            conda_path,
+            str(conda_path),
             "run",
             "-n",
             "whisperx_installer",
