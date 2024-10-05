@@ -1,6 +1,5 @@
 coqui-tts
 pydub
-whisperx
 tqdm
 requests
 numpy
