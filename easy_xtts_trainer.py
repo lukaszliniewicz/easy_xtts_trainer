@@ -108,8 +108,10 @@ def process_audio(input_path, session_path, args):
     return audio_sources_dir
 
 def transcribe_audio(audio_file, args, session_path):
-    output_dir = session_path / "transcriptions"
+    output_dir = (session_path / "transcriptions").resolve()
     output_dir.mkdir(exist_ok=True)
+    
+    audio_file_absolute = audio_file.resolve()
     
     conda_executable = get_conda_path(args)
     
@@ -122,7 +124,7 @@ def transcribe_audio(audio_file, args, session_path):
             "python",
             "-m",
             "whisperx",
-            str(audio_file),
+            str(audio_file_absolute),
             "--language", args.source_language,
             "--model", args.whisper_model,
             "--output_dir", str(output_dir),
@@ -137,7 +139,7 @@ def transcribe_audio(audio_file, args, session_path):
             "python",
             "-m",
             "whisperx",
-            str(audio_file),
+            str(audio_file_absolute),
             "--language", args.source_language,
             "--model", args.whisper_model,
             "--output_dir", str(output_dir),
