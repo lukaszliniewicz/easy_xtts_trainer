@@ -38,7 +38,8 @@ def parse_arguments():
     parser.add_argument("--xtts-model-name", help="Name for the trained model")
     parser.add_argument("--sample-method", choices=["maximise-punctuation", "punctuation-only", "mixed"], default="maximise-punctuation", help="Method for preparing training samples")
     parser.add_argument("-conda_env", help="Name of the Conda environment to use")
-
+    parser.add_argument("-conda_path", help="Path to the Conda installation folder")
+    
     return parser.parse_args()
 
 def create_session_folder(session_name):
