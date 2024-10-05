@@ -19,6 +19,7 @@ from datetime import datetime
 import requests
 from tqdm import tqdm
 import re
+import logging
 
 conda_path = Path("../conda/Scripts/conda.exe")
 
