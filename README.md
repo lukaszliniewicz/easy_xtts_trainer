@@ -1,6 +1,6 @@
 # Easy XTTS Trainer
 
-This command line app was designed to work with [Pandrator](https://github.com/lukaszliniewicz/Pandrator), but can be used on its own. Pandrator provides a GUI and a way to load and test the models immediately.
+This command line app was designed to work with [Pandrator](https://github.com/lukaszliniewicz/Pandrator), but can be used on its own. Pandrator provides a GUI and a way to load and test the models immediately, and it has an installer as well as portable packages that include this tool and its dependencies.
 
 ## Table of Contents
 - [Installation](#installation)
