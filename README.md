@@ -89,13 +89,13 @@ python easy-xtts-trainer.py --help
 | `--enhance` | Enable audio enhancement | No | Not implemented yet |
 | `-i`, `--input` | Input folder or single file | Yes | - |
 | `--session` | Name for the model folder | No | - |
-| `--separate` | Enable speech separation | No | - |
-| `--epochs` | Number of training epochs | No | (default: 6) |
+| `--separate` | Enable speech separation | No | Not implemented yet |
+| `--epochs` | Number of training epochs | No | Default: 6 |
 | `--xtts-base-model` | XTTS base model version | No | (default: `v2.0.2`) |
 | `--batch` | Batch size | No | (default: 2) |
-| `--gradient` | Gradient accumulation levels | No | (default: 1) |
+| `--gradient` | Gradient accumulation levels | No | Default: 1 |
 | `--xtts-model-name` | Name for the trained model | No | - |
-| `--sample-method` | Method for preparing training samples | No | maximise-punctuation, punctuation-only, mixed (default: `maximise-punctuation`) |
+| `--sample-method` | Method for preparing training samples | No | maximise-punctuation, punctuation-only, mixed (default: `mixed`) |
 | `-conda_env` | Name of the Conda environment to use | No | - |
 | `-conda_path` | Path to the Conda installation folder | No | - |
 
@@ -103,6 +103,6 @@ python easy-xtts-trainer.py --help
 
 The app uses three segment methods to prepare training samples:
 
-* `maximise-punctuation`: This method tries to maximise the lenght of segments (audio/text pairs) within the 11s and 200 characters limit and guided by punctuation. It produces fewer but longer training samples.
+* `maximise-punctuation`: This method tries to maximise the lenght of segments (audio/text pairs) within the 11s and 200 characters limit and is guided by punctuation (segments must end with a clause or sentence-ending punctuation mark). It produces fewer but longer training samples.
 * `punctuation-only`: This method is guided by punctuation marks, but doesn't try to maximise the lenght of the samples within the limit. It will cut and move to create the next segment when it encounters a sentence-ending or clause punctuation mark.
 * `mixed`: This method combines the `maximise-punctuation` and `punctuation-only` methods. 60% of samples are produced using the punctuation method, and the rest using the maximise punctiation method. 
