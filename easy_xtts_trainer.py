@@ -50,24 +50,73 @@ def create_session_folder(session_name):
     session_path.mkdir(parents=True, exist_ok=True)
     return session_path
 
-def get_conda_path(args):
-    if args.conda_path:
-        return os.path.join(args.conda_path, "conda.exe")
+def transcribe_audio(audio_file, args, session_path):
+    output_dir = (session_path / "transcriptions").resolve()
+    output_dir.mkdir(exist_ok=True)
     
-    if args.conda_env:
-        # Check usual Windows locations
+    audio_file_absolute = audio_file.resolve()
+    
+    def get_conda_path():
+        if args.conda_path:
+            return os.path.join(args.conda_path, "conda.exe")
+        
         possible_paths = [
             os.path.join(os.environ.get('USERPROFILE', ''), "anaconda3", "Scripts", "conda.exe"),
             os.path.join(os.environ.get('USERPROFILE', ''), "miniconda3", "Scripts", "conda.exe"),
             r"C:\ProgramData\Anaconda3\Scripts\conda.exe",
             r"C:\ProgramData\Miniconda3\Scripts\conda.exe"
         ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
+        
+        if args.conda_env:
+            for path in possible_paths:
+                if os.path.exists(path):
+                    return path
+        
+        return str(conda_path)
     
-    # Default to the hardcoded path
-    return str(conda_path)
+    conda_executable = get_conda_path()
+    
+    def run_whisperx(env):
+        command = [
+            conda_executable,
+            "run",
+            "-n",
+            env,
+            "python",
+            "-m",
+            "whisperx",
+            str(audio_file_absolute),
+            "--language", args.source_language,
+            "--model", args.whisper_model,
+            "--output_dir", str(output_dir),
+            "--output_format", "json"
+        ]
+        
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"Error running WhisperX with environment {env}: {e}")
+            print(f"Standard output: {e.stdout}")
+            print(f"Standard error: {e.stderr}")
+            return False
+    
+    if args.conda_env:
+        if not run_whisperx(args.conda_env):
+            raise Exception(f"Failed to run WhisperX with provided environment: {args.conda_env}")
+    else:
+        # Try with hardcoded path and whisperx_installer
+        if not run_whisperx("whisperx_installer"):
+            # If it fails, try with "whisperx" and one of the usual Windows paths
+            conda_executable = next((path for path in possible_paths if os.path.exists(path)), None)
+            if conda_executable:
+                if not run_whisperx("whisperx"):
+                    raise Exception("Failed to run WhisperX with both whisperx_installer and whisperx environments")
+            else:
+                raise Exception("Could not find a valid conda path")
+    
+    json_file = output_dir / f"{audio_file.stem}.json"
+    return json_file
 
 def create_log_file(session_path):
     log_file = session_path / f"session-log--{datetime.now().strftime('%Y-%m-%d--%H-%M')}.txt"
@@ -107,56 +156,6 @@ def process_audio(input_path, session_path, args):
             pass
 
     return audio_sources_dir
-
-def transcribe_audio(audio_file, args, session_path):
-    output_dir = (session_path / "transcriptions").resolve()
-    output_dir.mkdir(exist_ok=True)
-    
-    audio_file_absolute = audio_file.resolve()
-    
-    conda_executable = get_conda_path(args)
-    
-    if args.conda_env:
-        command = [
-            conda_executable,
-            "run",
-            "-n",
-            args.conda_env,
-            "python",
-            "-m",
-            "whisperx",
-            str(audio_file_absolute),
-            "--language", args.source_language,
-            "--model", args.whisper_model,
-            "--output_dir", str(output_dir),
-            "--output_format", "json"
-        ]
-    else:
-        command = [
-            str(conda_path),
-            "run",
-            "-n",
-            "whisperx_installer",
-            "python",
-            "-m",
-            "whisperx",
-            str(audio_file_absolute),
-            "--language", args.source_language,
-            "--model", args.whisper_model,
-            "--output_dir", str(output_dir),
-            "--output_format", "json"
-        ]
-    
-    try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Error running WhisperX: {e}")
-        print(f"Standard output: {e.stdout}")
-        print(f"Standard error: {e.stderr}")
-        raise
-    
-    json_file = output_dir / f"{audio_file.stem}.json"
-    return json_file
 
 def parse_transcription(json_file, audio_file, processed_dir, session_data, sample_method):
     with open(json_file, 'r', encoding='utf-8') as f:  
