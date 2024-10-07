@@ -167,10 +167,10 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data, samp
 
     def save_segment(start, end, text):
         # Add 50ms buffer to the start time, but ensure we don't go below 0
-        start_with_buffer = max(start - 0.05, 0)
+        start_with_buffer = max(start - 0.04, 0)
         
         # Add 60ms to the end time, but ensure we don't exceed audio length or 11s limit
-        end_with_buffer = min(end + 0.075, len(audio) / 1000, start_with_buffer + 11)
+        end_with_buffer = min(end + 0.04, len(audio) / 1000, start_with_buffer + 11)
         
         duration = end_with_buffer - start_with_buffer
         if duration <= 11 and len(text) <= 200:
