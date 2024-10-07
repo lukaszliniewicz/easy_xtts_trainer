@@ -20,6 +20,7 @@ import requests
 from tqdm import tqdm
 import re
 import logging
+import sys
 
 conda_path = Path("../conda/Scripts/conda.exe")
 
@@ -165,11 +166,15 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data, samp
     qualifying_segments = []
 
     def save_segment(start, end, text):
-        # Add 100ms to the end time, but ensure we don't exceed audio length or 11s limit
-        end_with_buffer = min(end + 0.1, len(audio) / 1000, start + 11)
-        duration = end_with_buffer - start
+        # Add 50ms buffer to the start time, but ensure we don't go below 0
+        start_with_buffer = max(start - 0.05, 0)
+        
+        # Add 60ms to the end time, but ensure we don't exceed audio length or 11s limit
+        end_with_buffer = min(end + 0.075, len(audio) / 1000, start_with_buffer + 11)
+        
+        duration = end_with_buffer - start_with_buffer
         if duration <= 11 and len(text) <= 200:
-            audio_segment = audio[int(start * 1000):int(end_with_buffer * 1000)]
+            audio_segment = audio[int(start_with_buffer * 1000):int(end_with_buffer * 1000)]
             output_file = processed_dir / f"{audio_file.stem}_segment_{len(qualifying_segments)}.wav"
             audio_segment.export(output_file, format="wav")
 
@@ -512,6 +517,36 @@ def optimize_model(out_path, base_model_path):
 
     return f"Model optimized and saved at {optimized_model}!", str(optimized_model)
 
+def copy_reference_samples(processed_dir, session_path):
+    pandrator_voices_dir = Path("../Pandrator/tts_voices")
+    if not pandrator_voices_dir.exists():
+        print("Pandrator tts_voices directory does not exist. Skipping reference sample copying.")
+        return
+
+    # Use the session folder name for the reference directory
+    session_name = session_path.name
+    reference_dir = pandrator_voices_dir / session_name
+    reference_dir.mkdir(exist_ok=True)
+
+    # Get all wav files from the processed directory
+    wav_files = list(processed_dir.glob('*.wav'))
+    
+    # Sort files by size in descending order
+    wav_files.sort(key=lambda x: x.stat().st_size, reverse=True)
+    
+    # Select the top 10% largest files
+    top_10_percent = wav_files[:max(3, len(wav_files) // 10)]
+    
+    # Randomly select 3 files from the top 10%
+    selected_files = random.sample(top_10_percent, min(3, len(top_10_percent)))
+    
+    # Copy selected files to the reference directory with new names
+    for i, file in enumerate(selected_files, start=1):
+        new_filename = f"{session_name}_{i}.wav"
+        shutil.copy2(file, reference_dir / new_filename)
+    
+    print(f"Copied {len(selected_files)} reference samples to {reference_dir}")
+
 def main():
     args = parse_arguments()
     session_path = create_session_folder(args.session)
@@ -571,5 +606,23 @@ def main():
     print(optimization_message)
     print(f"Optimized model path: {optimized_model_path}")
 
+    if optimized_model_path:  # This ensures the optimization was successful
+        copy_reference_samples(audio_sources_dir / "processed", session_path)
+        print("Reference samples copied successfully.")
+    else:
+        print("Warning: Optimized model path not found. Reference samples not copied.")
+
+    return True  # Indicate successful completion
+
 if __name__ == "__main__":
-    main()
+    try:
+        success = main()
+        if success:
+            print("Training process completed successfully.")
+            sys.exit(0)  # Exit with success code
+        else:
+            print("Training process failed.")
+            sys.exit(1)  # Exit with error code
+    except Exception as e:
+        print(f"An unexpected error occurred: {str(e)}")
+        sys.exit(1)  # Exit with error code
