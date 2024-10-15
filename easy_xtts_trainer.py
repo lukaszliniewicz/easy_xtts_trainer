@@ -93,6 +93,13 @@ def transcribe_audio(audio_file, args, session_path):
             "--output_format", "json"
         ]
         
+        # Check if GPU is from Pascal generation
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0).lower()
+            pascal_gpus = ['1060', '1070', '1080', '1660', '1650']
+            if any(gpu in gpu_name for gpu in pascal_gpus):
+                command.extend(["--fp16", "False"])
+        
         try:
             subprocess.run(command, check=True, capture_output=True, text=True)
             return True
