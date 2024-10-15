@@ -98,7 +98,7 @@ def transcribe_audio(audio_file, args, session_path):
             gpu_name = torch.cuda.get_device_name(0).lower()
             pascal_gpus = ['1060', '1070', '1080', '1660', '1650']
             if any(gpu in gpu_name for gpu in pascal_gpus):
-                command.extend(["--fp16", "False"])
+                command.extend(["--compute_type", "int8"])
         
         try:
             subprocess.run(command, check=True, capture_output=True, text=True)
