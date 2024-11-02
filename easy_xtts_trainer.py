@@ -21,14 +21,544 @@ from tqdm import tqdm
 import re
 import logging
 import sys
+import time
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Tuple, Optional, Literal
+import json
+from pathlib import Path
+from scipy import signal
+import numpy as np
+from df.enhance import enhance, init_df, load_audio, save_audio
+import soundfile as sf
+import librosa
 
 conda_path = Path("../conda/Scripts/conda.exe")
+
+class AudioProcessor:
+    def __init__(self, target_sr: int = 22050):
+        self.target_sr = target_sr
+        self.deepfilter_model = None
+        self.df_state = None
+        
+        # Compression profiles optimized for different voice types
+        self.compression_profiles: Dict = {
+            'male': {
+                'threshold': -18,
+                'ratio': 3.0,
+                'attack': 0.020,
+                'release': 0.150,
+                'knee_width': 6
+            },
+            'female': {
+                'threshold': -16,
+                'ratio': 2.5,
+                'attack': 0.015,
+                'release': 0.120,
+                'knee_width': 4
+            },
+            'neutral': {
+                'threshold': -17,
+                'ratio': 2.75,
+                'attack': 0.018,
+                'release': 0.135,
+                'knee_width': 5
+            }
+        }
+        
+        # De-essing profiles
+        self.dess_profiles: Dict = {
+            'low': {
+                'threshold': 0.15,
+                'ratio': 2.5,
+                'makeup_gain': 0.5,
+                'reduction_factor': 0.3,
+                'freq_range': (4500, 9000)
+            },
+            'high': {
+                'threshold': 0.25,
+                'ratio': 3.5,
+                'makeup_gain': 0.4,
+                'reduction_factor': 0.5,
+                'freq_range': (5000, 10000)
+            }
+        }
+        self.segment_window_ms = 200  # Window for finding cut points
+        self.analysis_window_ms = 2  # Window for energy analysis
+
+    def find_lowest_energy_point(self, audio: AudioSegment, 
+                               start_time: float, 
+                               end_time: float) -> float:
+        """
+        Find the quietest 2ms point between two timestamps.
+        Returns timestamp in seconds.
+        """
+        try:
+            print(f"\nAnalyzing window from {start_time:.3f}s to {end_time:.3f}s (duration: {end_time-start_time:.3f}s)")
+            
+            # Convert to milliseconds
+            start_ms = int(start_time * 1000)
+            end_ms = int(end_time * 1000)
+            
+            # Handle invalid time ranges
+            if end_ms <= start_ms:
+                print(f"Invalid time range: end ({end_ms}ms) <= start ({start_ms}ms)")
+                return start_time
+            
+            # Extract window for analysis
+            window = audio[start_ms:end_ms]
+            print(f"Window duration: {len(window)}ms")
+            
+            if len(window) < 4:
+                print(f"Window too short ({len(window)}ms), need at least 4ms. Using midpoint.")
+                return (start_time + end_time) / 2
+            
+            # Convert to numpy array for processing
+            samples = np.array(window.get_array_of_samples(), dtype=np.float32)
+            print(f"Number of samples: {len(samples)}")
+            
+            if len(samples) == 0:
+                print("No samples found in window. Using midpoint.")
+                return (start_time + end_time) / 2
+            
+            # Calculate size of 2ms window in samples
+            window_size = int(0.002 * window.frame_rate)  # 2ms window
+            print(f"Analysis window size: {window_size} samples ({window_size/window.frame_rate*1000:.1f}ms)")
+            
+            if window_size == 0 or len(samples) <= window_size:
+                print(f"Window size ({window_size}) too small or fewer samples ({len(samples)}) than window. Using midpoint.")
+                return (start_time + end_time) / 2
+            
+            # Calculate RMS energy for each 2ms window
+            energies = []
+            timestamps = []
+            
+            # Step 1ms at a time (half the window size for better precision)
+            step_size = window_size // 2
+            print(f"Step size: {step_size} samples ({step_size/window.frame_rate*1000:.1f}ms)")
+            
+            for i in range(0, len(samples) - window_size, step_size):
+                frame = samples[i:i+window_size]
+                if len(frame) == window_size:  # Only process complete windows
+                    rms = np.sqrt(np.mean(frame**2))
+                    energies.append(rms)
+                    timestamps.append(start_ms + i * 1000 / window.frame_rate)
+            
+            print(f"Number of analysis windows: {len(energies)}")
+            
+            if not energies:
+                print("No valid energy measurements found. Using midpoint.")
+                return (start_time + end_time) / 2
+                
+            # Find the lowest energy point
+            energies = np.array(energies)
+            timestamps = np.array(timestamps)
+            lowest_point_idx = np.argmin(energies)
+            
+            if lowest_point_idx >= len(timestamps):
+                print(f"Invalid index {lowest_point_idx} for timestamps array of length {len(timestamps)}. Using midpoint.")
+                return (start_time + end_time) / 2
+                
+            optimal_time = timestamps[lowest_point_idx] / 1000  # Convert to seconds
+            print(f"Found lowest energy at {optimal_time:.3f}s (energy: {energies[lowest_point_idx]:.2e})")
+            
+            # Ensure we stay within bounds
+            final_time = max(start_time, min(end_time, optimal_time))
+            if final_time != optimal_time:
+                print(f"Adjusted time to {final_time:.3f}s to stay within bounds")
+            
+            return final_time
+            
+        except Exception as e:
+            print(f"Error in find_lowest_energy_point: {str(e)}")
+            print(f"Parameters: start_time={start_time:.3f}s, end_time={end_time:.3f}s")
+            print(f"Audio length: {len(audio)}ms, frame_rate: {audio.frame_rate}Hz")
+            return (start_time + end_time) / 2
+            
+    def find_optimal_cut_points(self, segments: List[Dict], audio: AudioSegment) -> List[Dict[str, Tuple[float, Optional[float], Optional[float]]]]:
+        """
+        Find optimal cut points between segments by analyzing the quietest point 
+        between contextual words and segments. 
+        Adjusts the start and end by +-200ms from boundaries.
+        
+        Return a more detailed dictionary containing the cut points:
+        [{'start': ..., 'end': ..., 'prev_word_end': ..., 'next_word_start': ... }]
+        """
+        if not segments:
+            return []
+            
+        cut_points = []
+        audio_length_sec = len(audio) / 1000  # Convert to seconds
+        
+        for i in range(len(segments)):
+            curr_segment = segments[i]
+            curr_first_word = next((w for w in curr_segment["words"] if "start" in w), None)
+            curr_last_word = next((w for w in reversed(curr_segment["words"]) if "end" in w), None)
+            
+            if not curr_first_word or not curr_last_word:
+                continue
+                    
+            # Context - previous word's end time and next word's start time
+            prev_word_end = None
+            next_word_start = None
+                
+            # Default to 200ms window before/after if no timestamps exist for prior/next words.
+            if i > 0:
+                prev_segment = segments[i-1]
+                prev_last_word = next((w for w in reversed(prev_segment["words"]) if "end" in w), None)
+                if prev_last_word:
+                    prev_word_end = prev_last_word["end"]
+                else:
+                    prev_word_end = max(0, curr_first_word["start"] - 0.2)  # Default to 200ms before
+            else:
+                # If this is the first segment, look 200ms before.
+                prev_word_end = max(0, curr_first_word["start"] - 0.2)
+            
+            if i < len(segments) - 1:
+                next_segment = segments[i+1]
+                next_first_word = next((w for w in next_segment["words"] if "start" in w), None)
+                if next_first_word:
+                    next_word_start = next_first_word["start"]
+                else:
+                    next_word_start = min(audio_length_sec, curr_last_word["end"] + 0.2)  # Look 200ms after
+            else:
+                # If this is the last segment, look 200ms after.
+                next_word_start = min(audio_length_sec, curr_last_word["end"] + 0.2)
+            
+            # Find quietest point between prev segment's end and current first word
+            start_time = self.find_lowest_energy_point(audio, prev_word_end, curr_first_word["start"])
+            
+            # Find quietest point between curr last word and the next word's start
+            end_time = self.find_lowest_energy_point(audio, curr_last_word["end"], next_word_start)
+            
+            cut_points.append({
+                "start": start_time,
+                "end": end_time,
+                "prev_word_end": prev_word_end,
+                "next_word_start": next_word_start
+            })
+        
+        return cut_points
+
+
+    def process_segments(self, input_path: str, segments: List[Dict], output_dir: Path, args) -> List[Dict[str, str]]:
+        """
+        Process audio segments with optimal cut points and apply audio processing.
+        Use the context around segment boundaries for cleaner cutting.
+        """
+        try:
+            # Load audio file
+            audio = AudioSegment.from_wav(input_path)
+            
+            # Find optimal cut points using contextual windows
+            cut_points = self.find_optimal_cut_points(segments, audio)
+            
+            processed_segments = []
+            
+            # Process each segment
+            for i, cut_point in enumerate(cut_points):
+                start_ms = int(cut_point["start"] * 1000)
+                end_ms = int(cut_point["end"] * 1000)
+                
+                # Extract segment
+                segment_audio = audio[start_ms:end_ms]
+                
+                # Generate output filename
+                output_path = output_dir / f"{Path(input_path).stem}_segment_{i}.wav"
+                
+                # Export raw segment
+                segment_audio.export(str(output_path), format="wav")
+                
+                # Apply audio processing if requested
+                if any([args.normalize is not None, args.dess, args.denoise, args.compress]):
+                    success = self.process_audio(
+                        str(output_path),
+                        str(output_path),  # Process in place
+                        normalize_target=-float(args.normalize) if args.normalize else None,
+                        dess_profile='high' if args.dess else None,
+                        denoise=args.denoise,
+                        compress_profile=args.compress if args.compress else None
+                    )
+                    
+                    if not success:
+                        print(f"Warning: Failed to process segment {i}")
+                        continue
+                
+                # Store segment information with trimmed start/end times
+                processed_segments.append({
+                    "audio_file": str(output_path),
+                    "text": " ".join(w["word"] for w in segments[i]["words"]).strip(),
+                    "speaker_name": "001"
+                })
+            
+            return processed_segments
+            
+        except Exception as e:
+            print(f"Error processing segments: {str(e)}")
+            return []
+
+    def _init_deepfilter(self):
+        """Initialize DeepFilterNet model lazily"""
+        if self.deepfilter_model is None:
+            self.deepfilter_model, self.df_state, _ = init_df()
+
+    def process_audio(self, input_path: str, output_path: str, 
+                     normalize_target: Optional[float] = None,
+                     dess_profile: Optional[str] = None,
+                     denoise: bool = False,
+                     compress_profile: Optional[str] = None) -> bool:
+        try:
+            if denoise:
+                # Use DeepFilterNet's own loading and processing functions
+                self._init_deepfilter()
+                audio, _ = load_audio(input_path, sr=self.df_state.sr())
+                # Denoise the audio
+                audio = enhance(self.deepfilter_model, self.df_state, audio)
+                # Convert tensor to numpy array
+                audio = audio.cpu().numpy()
+                if audio.ndim == 2:  # If 2D array (channels, samples)
+                    audio = audio[0]  # Take first channel
+                sr = self.df_state.sr()
+            else:
+                # Load audio normally if no denoising needed
+                audio, sr = sf.read(input_path)
+
+            # Resample if needed
+            if sr != self.target_sr:
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=self.target_sr)
+            
+            # Normalize before compression
+            if normalize_target:
+                audio = self._normalize(audio, target_lufs=normalize_target)
+            
+            # Compress after normalization
+            if compress_profile:
+                audio = self._compress(audio, compress_profile)
+            
+            # De-ess last
+            if dess_profile:
+                audio = self._deess(audio, dess_profile)
+            
+            # Final peak normalization to prevent clipping
+            peak = np.max(np.abs(audio))
+            if peak > 0.99:
+                audio = audio * (0.99 / peak)
+            
+            # Save processed audio
+            sf.write(output_path, audio, self.target_sr)
+            return True
+            
+        except Exception as e:
+            print(f"Error processing audio: {str(e)}")
+            print(f"Audio shape: {audio.shape if 'audio' in locals() else 'not loaded'}")
+            print(f"Audio type: {type(audio) if 'audio' in locals() else 'not loaded'}")
+            print(f"Sample rate: {sr if 'sr' in locals() else 'not loaded'}")
+            return False
+    def _normalize(self, audio: np.ndarray, target_lufs: float = -16.0) -> np.ndarray:
+        """Normalize audio to target LUFS with true peak limiting"""
+        # Calculate current LUFS
+        rms = np.sqrt(np.mean(audio**2))
+        current_lufs = 20 * np.log10(rms) - 0.691
+        
+        # Calculate required gain
+        gain = 10 ** ((target_lufs - current_lufs) / 20)
+        
+        # Apply true peak limiting
+        peak = np.max(np.abs(audio * gain))
+        if peak > 0.99:
+            gain *= 0.99 / peak
+        
+        return audio * gain
+
+    def _compress(self, audio: np.ndarray, profile: Literal['male', 'female', 'neutral']) -> np.ndarray:
+        """Dynamic range compression with voice-optimized profiles"""
+        params = self.compression_profiles[profile]
+        
+        # Convert threshold to linear
+        threshold_linear = 10 ** (params['threshold'] / 20)
+        knee_lower = threshold_linear * (10 ** (-params['knee_width'] / 40))
+        knee_upper = threshold_linear * (10 ** (params['knee_width'] / 40))
+        
+        # Calculate gain reduction
+        gain_reduction = np.zeros_like(audio)
+        
+        # Below knee
+        mask_below = np.abs(audio) <= knee_lower
+        gain_reduction[mask_below] = 0
+        
+        # Above knee
+        mask_above = np.abs(audio) >= knee_upper
+        gain_above = (1 - 1/params['ratio']) * (20 * np.log10(np.abs(audio[mask_above])) - params['threshold'])
+        gain_reduction[mask_above] = gain_above
+        
+        # In knee
+        mask_knee = ~mask_below & ~mask_above
+        knee_curve = (1 - 1/params['ratio']) * ((20 * np.log10(np.abs(audio[mask_knee])) - params['threshold'] + params['knee_width']/2)**2 / (2 * params['knee_width']))
+        gain_reduction[mask_knee] = knee_curve
+        
+        # Apply attack/release envelope
+        attack_coef = np.exp(-1 / (params['attack'] * self.target_sr))
+        release_coef = np.exp(-1 / (params['release'] * self.target_sr))
+        
+        gain_reduction_smoothed = np.zeros_like(gain_reduction)
+        for i in range(1, len(gain_reduction)):
+            if gain_reduction[i] <= gain_reduction_smoothed[i-1]:
+                # Attack phase
+                gain_reduction_smoothed[i] = attack_coef * gain_reduction_smoothed[i-1] + (1 - attack_coef) * gain_reduction[i]
+            else:
+                # Release phase
+                gain_reduction_smoothed[i] = release_coef * gain_reduction_smoothed[i-1] + (1 - release_coef) * gain_reduction[i]
+        
+        # Convert gain reduction to linear domain and apply
+        gain_reduction_linear = 10 ** (gain_reduction_smoothed / 20)
+        return audio * gain_reduction_linear
+
+    def _deess(self, audio: np.ndarray, profile: Literal['low', 'high']) -> np.ndarray:
+        """Enhanced de-essing with two profiles"""
+        params = self.dess_profiles[profile]
+        
+        # Create bandpass filter for sibilance detection
+        nyquist = self.target_sr / 2
+        low_freq = params['freq_range'][0] / nyquist
+        high_freq = params['freq_range'][1] / nyquist
+        b, a = signal.butter(4, [low_freq, high_freq], btype='band')
+        
+        # Extract and process sibilance
+        sibilants = signal.filtfilt(b, a, audio)
+        
+        # Calculate adaptive threshold
+        rms = np.sqrt(np.mean(sibilants**2))
+        adaptive_threshold = params['threshold'] * rms
+        
+        # Apply compression to sibilants
+        mask = np.abs(sibilants) > adaptive_threshold
+        sibilants[mask] = (
+            adaptive_threshold + 
+            (np.abs(sibilants[mask]) - adaptive_threshold) / params['ratio']
+        ) * np.sign(sibilants[mask])
+        
+        # Apply makeup gain
+        sibilants *= params['makeup_gain']
+        
+        # Smooth transitions
+        env_b, env_a = signal.butter(2, 150 / nyquist, btype='low')
+        smoothed_sibilants = signal.filtfilt(env_b, env_a, sibilants)
+        
+        # Mix processed sibilants back with original
+        return audio - smoothed_sibilants * params['reduction_factor']
+
+def process_audio_files(input_files, output_dir, args):
+    """Process audio files with the specified effects"""
+    processor = AudioProcessor(target_sr=args.sample_rate)
+    
+    for input_file in input_files:
+        try:
+            input_path = Path(input_file)
+            output_path = Path(output_dir) / input_path.name
+            
+            # Process with selected effects
+            success = processor.process_audio(
+                str(input_path),
+                str(output_path),
+                normalize_target=-float(args.normalize) if args.normalize else None,
+                dess_profile='high' if args.dess else None,
+                denoise=args.denoise,
+                compress_profile=args.compress if args.compress else None
+            )
+            
+            if success:
+                print(f"Successfully processed: {input_path.name}")
+            else:
+                print(f"Failed to process: {input_path.name}")
+                
+        except Exception as e:
+            print(f"Error processing {input_file}: {str(e)}")
+
+@dataclass
+class TrainingMetrics:
+    model_name: str
+    start_time: float
+    end_time: float = 0
+    total_audio_duration_minutes: float = 0  # in minutes
+    total_training_minutes: float = 0
+    num_samples: int = 0
+    num_batches: int = 0
+    num_epochs: int = 0
+    gradient_accumulation: int = 0
+    language: str = ""
+    sample_rate: int = 0
+    text_losses: List[float] = None
+    mel_losses: List[float] = None
+    
+    def __post_init__(self):
+        self.text_losses = self.text_losses or []
+        self.mel_losses = self.mel_losses or []
+    
+    def update_training_time(self):
+        """Calculate training time in minutes"""
+        if self.end_time:
+            self.total_training_minutes = round((self.end_time - self.start_time) / 60, 2)
+    
+    def parse_loss_values(self, log_text: str, loss_type: str) -> List[float]:
+        losses = []
+        lines = log_text.split('\n')
+        for line in lines:
+            if f"avg_loss_{loss_type}_ce:" in line:
+                log_position = log_text.find(line)
+                context_before = log_text[max(0, log_position-1000):log_position]
+                
+                if '> EVALUATION' in context_before:
+                    number_match = re.search(r'\x1b$$\d+m\s*([\d.]+)', line)
+                    if not number_match:
+                        number_match = re.search(r'ce:\s*([\d.]+)', line)
+                    
+                    if number_match:
+                        value = float(number_match.group(1))
+                        losses.append(value)
+        return losses
+    
+    def update_from_log(self, log_path: Path):
+        with open(log_path, 'r', encoding='utf-8') as f:
+            log_text = f.read()
+        
+        self.text_losses = self.parse_loss_values(log_text, "text")
+        self.mel_losses = self.parse_loss_values(log_text, "mel")
+    
+    def calculate_audio_stats(self, audio_segments: List[Dict]):
+        """Calculate audio statistics from the training segments"""
+        self.num_samples = len(audio_segments)
+        self.num_batches = len(audio_segments) // 2  # assuming batch_size=2
+        total_seconds = sum(
+            AudioSegment.from_wav(seg['audio_file']).duration_seconds 
+            for seg in audio_segments
+        )
+        self.total_audio_duration_minutes = round(total_seconds / 60, 2)
+    
+    # def save(self, output_dir: Path):
+        # metrics_file = output_dir / "training_metrics.json"
+        # self.update_training_time()  # Update training time before saving
+        
+        # # Create a clean dict without internal tracking fields
+        # metrics_dict = {
+            # "model_name": self.model_name,
+            # "total_training_minutes": self.total_training_minutes,
+            # "total_audio_duration_minutes": self.total_audio_duration_minutes,
+            # "num_samples": self.num_samples,
+            # "num_batches": self.num_batches,
+            # "num_epochs": self.num_epochs,
+            # "gradient_accumulation": self.gradient_accumulation,
+            # "language": self.language,
+            # "sample_rate": self.sample_rate,
+            # "text_losses": self.text_losses,
+            # "mel_losses": self.mel_losses
+        # }
+        
+        # with open(metrics_file, 'w', encoding='utf-8') as f:
+            # json.dump(metrics_dict, f, indent=2)
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="XTTS Model Training App")
     parser.add_argument("--source-language", choices=["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh-cn", "ja", "ko", "hu"], required=True, help="Source language for XTTS")
-    parser.add_argument("--whisper-model", choices=["medium", "medium.en", "large-v2", "large-v3"], default="medium", help="Whisper model to use for transcription")
-    parser.add_argument("--denoise", action="store_true", help="Enable denoising")
+    parser.add_argument("--whisper-model", choices=["medium", "medium.en", "large-v2", "large-v3"], default="large-v3", help="Whisper model to use for transcription")
     parser.add_argument("--enhance", action="store_true", help="Enable audio enhancement")
     parser.add_argument("-i", "--input", required=True, help="Input folder or single file")
     parser.add_argument("--session", help="Name for the session folder")
@@ -41,8 +571,53 @@ def parse_arguments():
     parser.add_argument("--sample-method", choices=["maximise-punctuation", "punctuation-only", "mixed"], default="maximise-punctuation", help="Method for preparing training samples")
     parser.add_argument("-conda_env", help="Name of the Conda environment to use")
     parser.add_argument("-conda_path", help="Path to the Conda installation folder")
+    parser.add_argument("--sample-rate", type=int, choices=[22050, 44100], default=22050, 
+                   help="Sample rate for WAV files (default: 22050, recommended for XTTS training)")
+    parser.add_argument("--max-audio-time", type=float, default=11,
+                       help="Maximum audio duration in seconds (default: 11.6)")
+    parser.add_argument("--max-text-length", type=int, default=200,
+                       help="Maximum text length in characters (default: 200)")
+    parser.add_argument("--align-model", 
+                       help="""Model to use for phoneme-level alignment. Common options for English include:
+                       - WAV2VEC2_ASR_LARGE_LV60K_960H (largest, most accurate)
+                       - WAV2VEC2_ASR_BASE_960H (medium size)
+                       - WAV2VEC2_ASR_BASE_100H (smallest, fastest)""")
+    parser.add_argument("--normalize", type=float, nargs='?', const=16.0,
+                       help="Normalize audio to target LUFS (default: -16.0 if no value provided)")
+    parser.add_argument("--dess", action="store_true",
+                       help="Apply de-essing to reduce sibilance")
+    parser.add_argument("--denoise", action="store_true",
+                       help="Apply DeepFilterNet noise reduction")
+    parser.add_argument("--compress", choices=['male', 'female', 'neutral'],
+                       help="Apply dynamic range compression with voice-specific profile")
     
-    return parser.parse_args()
+    parser.add_argument("--method-proportion", default="6_4",
+                       help="For mixed method, proportion of maximise-punctuation to punctuation-only (e.g., '6_4' for 60-40 split)")
+    parser.add_argument("--training-proportion", default="8_2",
+                       help="Proportion of training to validation data (e.g., '8_2' for 80-20 split)")
+    
+    args = parser.parse_args()
+    
+    # Validate and convert proportions
+    if args.method_proportion:
+        try:
+            max_prop, punct_prop = map(int, args.method_proportion.split('_'))
+            if max_prop + punct_prop != 10:
+                raise ValueError("Method proportions must sum to 10")
+            args.method_proportion = max_prop / 10
+        except (ValueError, AttributeError):
+            raise ValueError("Method proportion must be in format 'N_M' where N+M=10 (e.g., '6_4')")
+            
+    if args.training_proportion:
+        try:
+            train_prop, val_prop = map(int, args.training_proportion.split('_'))
+            if train_prop + val_prop != 10:
+                raise ValueError("Training proportions must sum to 10")
+            args.training_proportion = train_prop / 10
+        except (ValueError, AttributeError):
+            raise ValueError("Training proportion must be in format 'N_M' where N+M=10 (e.g., '8_2')")
+    
+    return args
 
 def create_session_folder(session_name):
     if not session_name:
@@ -78,6 +653,7 @@ def transcribe_audio(audio_file, args, session_path):
     conda_executable = get_conda_path()
     
     def run_whisperx(env):
+        # Build base command without align_model
         command = [
             conda_executable,
             "run",
@@ -92,6 +668,10 @@ def transcribe_audio(audio_file, args, session_path):
             "--output_dir", str(output_dir),
             "--output_format", "json"
         ]
+        
+        # Only add align_model if it was specified
+        if hasattr(args, 'align_model') and args.align_model:
+            command.extend(["--align_model", args.align_model])
         
         # Check if GPU is from Pascal generation
         if torch.cuda.is_available():
@@ -134,157 +714,435 @@ def create_json_file(session_path):
     json_file = session_path / f"session-data--{datetime.now().strftime('%Y-%m-%d--%H-%M')}.json"
     return json_file
 
-def convert_to_wav(input_path, output_path):
+def convert_to_wav(input_path, output_path, target_sample_rate):
+    # If input is already a WAV file, check its properties
+    if input_path.suffix.lower() == '.wav':
+        try:
+            waveform, sample_rate = torchaudio.load(input_path)
+            is_mono = waveform.shape[0] == 1
+            
+            # If the file already matches our requirements, just copy it
+            if sample_rate == target_sample_rate and is_mono:
+                shutil.copy2(input_path, output_path)
+                return
+            
+        except Exception as e:
+            print(f"Error reading WAV file {input_path}: {e}")
+            # Continue to regular conversion if there's an error reading the WAV
+    
+    # Convert the file if it's not WAV or doesn't match requirements
     audio = AudioSegment.from_file(input_path)
-    audio = audio.set_frame_rate(44100).set_channels(1).set_sample_width(2)
+    audio = audio.set_frame_rate(target_sample_rate).set_channels(1).set_sample_width(2)
     audio.export(output_path, format="wav")
 
 def process_audio(input_path, session_path, args):
+    """Process audio files and prepare them for training"""
+    # Create necessary directories
     audio_sources_dir = session_path / "audio_sources"
-    audio_sources_dir.mkdir(exist_ok=True)
+    audio_sources_dir.mkdir(exist_ok=True, parents=True)
     processed_dir = audio_sources_dir / "processed"
-    processed_dir.mkdir(exist_ok=True)
+    processed_dir.mkdir(exist_ok=True, parents=True)
 
     if os.path.isfile(input_path):
-        files = [input_path]
+        files = [Path(input_path)]
     else:
-        files = [f for f in os.listdir(input_path) if f.endswith(('.mp3', '.wav', '.flac', '.ogg'))]
+        input_path = Path(input_path)
+        files = [f for f in input_path.rglob('*') if f.suffix.lower() in ('.mp3', '.wav', '.flac', '.ogg')]
 
+    # First convert all files to WAV at target sample rate
     for file in files:
-        input_file = Path(input_path) / file if os.path.isdir(input_path) else Path(file)
-        output_file = audio_sources_dir / f"{input_file.stem}.wav"
-        convert_to_wav(input_file, output_file)
-
-        if args.separate:
-            # Placeholder for speech separation
-            pass
-
-        if args.denoise or args.enhance:
-            # Placeholder for denoising/enhancement
-            pass
+        output_file = audio_sources_dir / f"{file.stem}.wav"
+        convert_to_wav(file, output_file, args.sample_rate)
 
     return audio_sources_dir
 
-def parse_transcription(json_file, audio_file, processed_dir, session_data, sample_method):
-    with open(json_file, 'r', encoding='utf-8') as f:  
-        transcription = json.load(f)
 
-    audio = AudioSegment.from_wav(audio_file)
-    qualifying_segments = []
 
-    def save_segment(start, end, text):
-        # Add 50ms buffer to the start time, but ensure we don't go below 0
-        start_with_buffer = max(start - 0.04, 0)
+def save_segment(audio: AudioSegment, 
+                start_ms: int, 
+                end_ms: int, 
+                output_path: Path,
+                args) -> bool:
+    """
+    Save an audio segment with optional processing.
+    """
+    try:
+        # Extract segment
+        segment_audio = audio[start_ms:end_ms]
         
-        # Add 60ms to the end time, but ensure we don't exceed audio length or 11s limit
-        end_with_buffer = min(end + 0.04, len(audio) / 1000, start_with_buffer + 11)
-        
-        duration = end_with_buffer - start_with_buffer
-        if duration <= 11 and len(text) <= 200:
-            audio_segment = audio[int(start_with_buffer * 1000):int(end_with_buffer * 1000)]
-            output_file = processed_dir / f"{audio_file.stem}_segment_{len(qualifying_segments)}.wav"
-            audio_segment.export(output_file, format="wav")
+        if len(segment_audio) > 0:
+            # First save the raw segment
+            segment_audio.export(str(output_path), format="wav")
+            
+            # Apply audio processing if requested
+            if any([args.normalize is not None, args.dess, args.denoise, args.compress]):
+                processor = AudioProcessor(target_sr=args.sample_rate)
+                success = processor.process_audio(
+                    str(output_path),
+                    str(output_path),  # Process in place
+                    normalize_target=-float(args.normalize) if args.normalize else None,
+                    dess_profile='high' if args.dess else None,
+                    denoise=args.denoise,
+                    compress_profile=args.compress if args.compress else None
+                )
+                return success
+            return True
+            
+    except Exception as e:
+        print(f"Error saving segment: {str(e)}")
+    return False
 
-            if output_file.exists() and text.strip():
-                qualifying_segments.append({
-                    "audio_file": str(output_file.absolute()),
-                    "text": text.strip(),
-                    "speaker_name": "001"
-                })
-                return True
-        return False
 
-    if sample_method == "maximise-punctuation":
-        process_maximise_punctuation(transcription['segments'], save_segment)
-    elif sample_method == "punctuation-only":
-        process_punctuation_only(transcription['segments'], save_segment)
-    elif sample_method == "mixed":
-        process_mixed(transcription['segments'], save_segment)
-
-    print(f"Processed {audio_file.name}: {len(qualifying_segments)} qualifying segments")
+def is_abbreviation(text, pos):
+    """Check if punctuation is part of an abbreviation."""
+    common_abbrev = [
+        "Mr.", "Mrs.", "Ms.", "Dr.", "Prof.", "Sr.", "Jr.", "et.", "al.", 
+        "etc.", "e.g.", "i.e.", "vs.", "Ph.D.", "M.D.", "B.A.", "M.A.",
+        "a.m.", "p.m.", "U.S.", "U.K.", "St."
+    ]
     
-    session_data['qualifying_segments'].extend(qualifying_segments)
-    return len(qualifying_segments)
+    # Look back up to 5 characters to catch abbreviations
+    start = max(0, pos - 5)
+    text_slice = text[start:pos + 1].lower()
+    
+    return any(abbr.lower() in text_slice for abbr in common_abbrev)
 
-def process_maximise_punctuation(segments, save_segment):
-    current_segment = {
-        "start": None,
-        "end": None,
-        "text": "",
-        "last_punctuation": None
-    }
+def find_real_sentence_end(text, pos):
+    """
+    Determine if a punctuation mark is a real sentence ending.
+    Handles cases like ." .) .") etc.
+    """
+    if pos >= len(text):
+        return pos
+    
+    stack = []
+    i = pos + 1
+    
+    while i < len(text):
+        if text[i] in '"\'(':
+            stack.append(text[i])
+        elif text[i] in '"\')':
+            if stack and ((stack[-1] == '"' and text[i] == '"') or 
+                         (stack[-1] == "'" and text[i] == "'") or
+                         (stack[-1] == "(" and text[i] == ")")):
+                stack.pop()
+        elif text[i] not in ' \t\n' and not stack:
+            break
+        i += 1
+    
+    return i - 1
 
-    for segment in segments:
-        for word in segment.get('words', []):
-            if 'start' not in word or 'end' not in word:
+def parse_transcription(json_file, audio_file, processed_dir, session_data, 
+                       sample_method, args):
+    """Parse transcription and extract training segments with clean cuts."""
+    with open(json_file, 'r', encoding='utf-8') as f:
+        transcription = json.load(f)
+    
+    processor = AudioProcessor(target_sr=args.sample_rate)
+    qualifying_segments = session_data['qualifying_segments']
+    
+    # Extract all words from all segments into a flat list
+    all_words = []
+    for segment in transcription['segments']:
+        if segment.get('words'):
+            all_words.extend(segment['words'])
+    
+    # Initialize containers for segment information
+    pending_segments = []
+    
+    def is_valid_timestamps(word):
+        """Check if word has valid timestamps."""
+        if not all(key in word for key in ['start', 'end', 'word']):
+            return False
+        try:
+            float(word['start'])
+            float(word['end'])
+            return True
+        except (ValueError, TypeError):
+            return False
+            
+    def find_next_valid_break(words, start_idx):
+        """Find next valid punctuation break with timestamps."""
+        for i in range(start_idx, len(words)):
+            word = words[i]
+            if is_valid_timestamps(word) and any(p in word['word'] for p in '.!?;,-'):
+                if not is_abbreviation(word['word'], len(word['word'])-1):
+                    return i
+        return None
+        
+    def calculate_segment_duration(words):
+        """Calculate duration between first and last word with valid timestamps."""
+        valid_words = [w for w in words if is_valid_timestamps(w)]
+        if not valid_words:
+            return 0
+        return float(valid_words[-1]['end']) - float(valid_words[0]['start'])
+
+    def process_maximise_punctuation(current_segment=None):
+        if current_segment is None:
+            current_segment = {
+                "words": [],
+                "text": "",
+                "break_points": []
+            }
+        
+        segments_processed = 0
+        words_to_process = current_segment["words"] if current_segment["words"] else all_words
+        
+        i = 0
+        while i < len(words_to_process):
+            word = words_to_process[i]
+            
+            # Check if current word has valid timestamps
+            if not is_valid_timestamps(word):
+                # If word has punctuation, we need to handle backtracking
+                if any(p in word['word'] for p in '.!?;,-'):
+                    if current_segment["words"]:
+                        # Try to build new segment from current segment's start up to last valid break
+                        last_valid_break = None
+                        current_duration = 0
+                        
+                        for idx, w in enumerate(current_segment["words"]):
+                            if is_valid_timestamps(w):
+                                if any(p in w['word'] for p in '.!?;,-'):
+                                    if not is_abbreviation(w['word'], len(w['word'])-1):
+                                        temp_duration = calculate_segment_duration(current_segment["words"][:idx + 1])
+                                        if temp_duration <= args.max_audio_time:
+                                            last_valid_break = idx
+                                            current_duration = temp_duration
+                        
+                        if last_valid_break is not None:
+                            # Add segment to pending instead of saving immediately
+                            valid_segment = current_segment["words"][:last_valid_break + 1]
+                            pending_segments.append({
+                                "words": valid_segment,
+                                "text": " ".join(w['word'] for w in valid_segment)
+                            })
+                            segments_processed += 1
+                    
+                    # Whether we saved a segment or not, find next valid starting point
+                    next_valid_idx = None
+                    for j in range(i + 1, len(words_to_process)):
+                        if (is_valid_timestamps(words_to_process[j]) and 
+                            any(p in words_to_process[j]['word'] for p in '.!?;,-')):
+                            next_valid_idx = j
+                            break
+                    
+                    if next_valid_idx:
+                        i = next_valid_idx + 1
+                        current_segment["words"] = []
+                        current_segment["text"] = ""
+                        current_segment["break_points"] = []
+                        continue
+                    else:
+                        break
+                
+                # Skip words without timestamps
+                i += 1
                 continue
-
-            if current_segment["start"] is None:
-                current_segment["start"] = word['start']
-
-            current_segment["end"] = word['end']
+ # Before adding word, check if current segment already exceeds limits
+            if current_segment["words"]:
+                current_duration = calculate_segment_duration(current_segment["words"])
+                if current_duration > args.max_audio_time:
+                    if current_segment["break_points"]:
+                        optimal_break = current_segment["break_points"][-1]
+                        pending_segments.append({
+                            "words": optimal_break["words"],
+                            "text": optimal_break["text"]
+                        })
+                        segments_processed += 1
+                        # Reset segment
+                        current_segment["words"] = []
+                        current_segment["text"] = ""
+                        current_segment["break_points"] = []
+                    else:
+                        # If no valid breaks, reset and continue
+                        current_segment["words"] = []
+                        current_segment["text"] = ""
+                        current_segment["break_points"] = []
+            
+            # Add word to current segment
+            current_segment["words"].append(word)
             current_segment["text"] += " " + word['word']
-
-            if re.search(r'[.!?,;:]', word['word']):
-                current_segment["last_punctuation"] = {
-                    "end": word['end'],
-                    "text": current_segment["text"]
-                }
-
-            duration = current_segment["end"] - current_segment["start"]
-            if duration > 11 or len(current_segment["text"]) > 200:
-                if current_segment["last_punctuation"]:
-                    save_segment(current_segment["start"], 
-                                 current_segment["last_punctuation"]["end"], 
-                                 current_segment["last_punctuation"]["text"])
-                    current_segment = {"start": None, "end": None, "text": "", "last_punctuation": None}
+            
+            duration = calculate_segment_duration(current_segment["words"])
+            text_length = len(current_segment["text"])
+            
+            # Check if this word creates a potential break point
+            if any(p in word['word'] for p in '.!?;,-'):
+                if not is_abbreviation(word['word'], len(word['word'])-1):
+                    if duration <= args.max_audio_time and text_length <= args.max_text_length:
+                        current_segment["break_points"].append({
+                            "words": current_segment["words"].copy(),
+                            "text": current_segment["text"],
+                            "duration": duration
+                        })
+            
+            # Check if we've exceeded limits
+            if duration > args.max_audio_time or text_length > args.max_text_length:
+                if current_segment["break_points"]:
+                    optimal_break = current_segment["break_points"][-1]
+                    pending_segments.append({
+                        "words": optimal_break["words"],
+                        "text": optimal_break["text"]
+                    })
+                    segments_processed += 1
+                    # Reset segment with remaining words
+                    break_word_index = current_segment["words"].index(optimal_break["words"][-1])
+                    current_segment["words"] = current_segment["words"][break_word_index + 1:]
+                    current_segment["text"] = " ".join(word['word'] for word in current_segment["words"])
+                    current_segment["break_points"] = []
                 else:
-                    current_segment = {"start": None, "end": None, "text": "", "last_punctuation": None}
+                    # If no valid breaks, reset and continue
+                    current_segment["words"] = []
+                    current_segment["text"] = ""
+                    current_segment["break_points"] = []
+            
+            i += 1
+        
+        # Process any remaining segment
+        if current_segment["words"] and current_segment["break_points"]:
+            optimal_break = current_segment["break_points"][-1]
+            pending_segments.append({
+                "words": optimal_break["words"],
+                "text": optimal_break["text"]
+            })
+            segments_processed += 1
+        
+        return segments_processed
 
-    if current_segment["start"] is not None and current_segment["last_punctuation"]:
-        save_segment(current_segment["start"], 
-                     current_segment["last_punctuation"]["end"], 
-                     current_segment["last_punctuation"]["text"])
-
-def process_punctuation_only(segments, save_segment):
-    current_segment = {
-        "start": None,
-        "end": None,
-        "text": ""
-    }
-
-    for segment in segments:
-        for word in segment.get('words', []):
-            if 'start' not in word or 'end' not in word:
+    def process_punctuation_only(current_segment=None):
+        segments_processed = 0
+        current_words = current_segment["words"] if current_segment else []
+        i = 0
+        
+        while i < len(all_words):
+            word = all_words[i]
+            
+            if not is_valid_timestamps(word):
+                if any(p in word['word'] for p in '.!?;,-'):
+                    # Try to extend to next punctuation mark
+                    next_break_idx = find_next_valid_break(all_words, i + 1)
+                    if next_break_idx:
+                        # Check if extended segment would be within limits
+                        potential_segment = current_words + all_words[i:next_break_idx + 1]
+                        duration = calculate_segment_duration(potential_segment)
+                        text_length = len(" ".join(w['word'] for w in potential_segment))
+                        
+                        if duration <= args.max_audio_time and text_length <= args.max_text_length:
+                            if duration >= 2.0:  # Minimum duration check
+                                pending_segments.append({
+                                    "words": potential_segment,
+                                    "text": " ".join(w['word'] for w in potential_segment)
+                                })
+                                segments_processed += 1
+                                current_words = []
+                                i = next_break_idx + 1
+                                continue
+                    
+                    # If extension failed, start fresh from next valid break
+                    next_start = find_next_valid_break(all_words, i + 1)
+                    if next_start:
+                        i = next_start
+                        current_words = []
+                    else:
+                        break
+                i += 1
                 continue
+            
+            current_words.append(word)
+            
+            if len(current_words) >= 2:
+                duration = calculate_segment_duration(current_words)
+                current_text = " ".join(w['word'] for w in current_words)
+                
+                if duration > args.max_audio_time or len(current_text) > args.max_text_length:
+                    current_words = [word]
+                    continue
+                
+                if duration >= 2.0 and any(p in word['word'] for p in '.!?;,-'):
+                    if not is_abbreviation(word['word'], len(word['word'])-1):
+                        pending_segments.append({
+                            "words": current_words,
+                            "text": current_text
+                        })
+                        segments_processed += 1
+                        current_words = []
+            
+            i += 1
+        
+        return segments_processed
 
-            if current_segment["start"] is None:
-                current_segment["start"] = word['start']
-
-            current_segment["end"] = word['end']
-            current_segment["text"] += " " + word['word']
-
-            if re.search(r'[.!?]', word['word']) or (re.search(r'[,;:]', word['word']) and 
-                                                     (current_segment["end"] - current_segment["start"] > 10 or 
-                                                      len(current_segment["text"]) > 190)):
-                save_segment(current_segment["start"], current_segment["end"], current_segment["text"])
-                current_segment = {"start": None, "end": None, "text": ""}
-
-    if current_segment["start"] is not None:
-        save_segment(current_segment["start"], current_segment["end"], current_segment["text"])
-
-def process_mixed(segments, save_segment):
-    max_punct_segments = []
-    process_maximise_punctuation(segments, lambda start, end, text: max_punct_segments.append((start, end, text)))
-
-    for i, segment in enumerate(max_punct_segments):
-        if i % 5 < 3:  # 60% of segments
-            sub_segments = [s for s in segments if segment[0] <= s['start'] and s['end'] <= segment[1]]
-            process_punctuation_only(sub_segments, save_segment)
+    def process_mixed(method_proportion=0.6):
+        if not all_words:
+            return 0
+            
+        total_duration = calculate_segment_duration(all_words)
+        split_target = total_duration * method_proportion
+        
+        # Find best split point
+        split_index = None
+        best_diff = float('inf')
+        
+        for i, word in enumerate(all_words):
+            if is_valid_timestamps(word) and any(p in word['word'] for p in '.!?'):
+                if not is_abbreviation(word['word'], len(word['word'])-1):
+                    duration = calculate_segment_duration(all_words[:i + 1])
+                    diff = abs(duration - split_target)
+                    if diff < best_diff:
+                        best_diff = diff
+                        split_index = i
+        
+        segments_count = 0
+        
+        if split_index:
+            # Split the words
+            first_part = all_words[:split_index + 1]
+            second_part = all_words[split_index + 1:]
+            
+            # Process first part with maximise-punctuation
+            first_segment = {
+                "words": first_part,
+                "text": "",
+                "break_points": []
+            }
+            segments_count += process_maximise_punctuation(first_segment)
+            
+            # Process second part with punctuation-only
+            second_segment = {
+                "words": second_part
+            }
+            segments_count += process_punctuation_only(second_segment)
         else:
-            save_segment(*segment)
+            # If no good split point, use maximise-punctuation for whole file
+            segments_count += process_maximise_punctuation()
+        
+        return segments_count
 
-def create_metadata_files(session_data, session_path):
+    # Main processing logic
+    segments_count = 0
+    if sample_method == "maximise-punctuation":
+        segments_count = process_maximise_punctuation()
+    elif sample_method == "punctuation-only":
+        segments_count = process_punctuation_only()
+    elif sample_method == "mixed":
+        method_prop = args.method_proportion if hasattr(args, 'method_proportion') else 0.6
+        segments_count = process_mixed(method_prop)
+    
+    # Process all pending segments with optimal cut points
+    if pending_segments:
+        processed_segments = processor.process_segments(
+            str(audio_file),
+            pending_segments,
+            processed_dir,
+            args
+        )
+        
+        # Add processed segments to session data
+        qualifying_segments.extend(processed_segments)
+    
+    return segments_count       
+
+def create_metadata_files(session_data, session_path, training_proportion=0.8):  # Add parameter with default
     databases_dir = session_path / "databases"
     databases_dir.mkdir(exist_ok=True)
 
@@ -312,7 +1170,7 @@ def create_metadata_files(session_data, session_path):
 
     random.shuffle(valid_samples)
 
-    train_size = int(0.8 * len(valid_samples))
+    train_size = int(training_proportion * len(valid_samples))  # Use the provided proportion
     train_samples = valid_samples[:train_size]
     eval_samples = valid_samples[train_size:]
 
@@ -374,7 +1232,12 @@ def download_models(base_path, xtts_base_model):
         else:
             print(f"Error: {filename} does not exist after download attempt!")
 
-def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acumm, train_csv, eval_csv, output_path, max_audio_length=255995):
+def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acumm, 
+              train_csv, eval_csv, output_path, sample_rate, model_name, max_audio_time,
+              max_text_length):
+    """
+    Train the GPT model.
+    """
     RUN_NAME = "GPT_XTTS_FT"
     PROJECT_NAME = "XTTS_trainer"
     DASHBOARD_LOGGER = "tensorboard"
@@ -382,6 +1245,15 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
     CHECKPOINTS_OUT_PATH = os.path.join(Path.cwd(), "base_models", f"{version}")
     os.makedirs(CHECKPOINTS_OUT_PATH, exist_ok=True)
 
+    # # Initialize metrics tracking
+    # metrics = TrainingMetrics(
+        # model_name=model_name,
+        # start_time=time.time(),
+        # num_epochs=num_epochs,
+        # gradient_accumulation=grad_acumm,
+        # language=language,
+        # sample_rate=sample_rate
+    # )
 
     config_dataset = BaseDatasetConfig(
         formatter="coqui",
@@ -404,11 +1276,15 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
     if custom_model and os.path.exists(custom_model) and custom_model.endswith('.pth'):
         XTTS_CHECKPOINT = custom_model
 
+    # Calculate max lengths from max_audio_time and sample_rate
+    max_wav_length = int((max_audio_time + 0.5) * sample_rate) # Convert seconds to samples
+    max_conditioning_length = max_wav_length  # Same as max_wav_length for XTTS
+
     model_args = GPTArgs(
-        max_conditioning_length=132300,
-        min_conditioning_length=66150,
-        max_wav_length=max_audio_length,
-        max_text_length=200,
+        max_conditioning_length=max_conditioning_length,
+        min_conditioning_length=6615,
+        max_wav_length=max_wav_length,
+        max_text_length=max_text_length,  # Use the parameter directly
         mel_norm_file=MEL_NORM_FILE,
         dvae_checkpoint=DVAE_CHECKPOINT,
         xtts_checkpoint=XTTS_CHECKPOINT,
@@ -418,9 +1294,14 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
         gpt_stop_audio_token=1025,
         gpt_use_masking_gt_prompt_approach=True,
         gpt_use_perceiver_resampler=True,
+        debug_loading_failures=True,
     )
 
-    audio_config = XttsAudioConfig(sample_rate=22050, dvae_sample_rate=22050, output_sample_rate=24000)
+    audio_config = XttsAudioConfig(
+        sample_rate=sample_rate,
+        dvae_sample_rate=22050,
+        output_sample_rate=24000
+    )
 
     config = GPTTrainerConfig(
         epochs=num_epochs,
@@ -439,10 +1320,18 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
         save_n_checkpoints=1,
         save_checkpoints=True,
         optimizer="AdamW",
-        optimizer_params={"betas": [0.9, 0.96], "eps": 1e-8, "weight_decay": 1e-2},
+        optimizer_params={
+            "betas": [0.9, 0.96],
+            "eps": 1e-8,
+            "weight_decay": 1e-2
+        },
         lr=5e-06,
         lr_scheduler="MultiStepLR",
-        lr_scheduler_params={"milestones": [50000 * 18, 150000 * 18, 300000 * 18], "gamma": 0.5, "last_epoch": -1},
+        lr_scheduler_params={
+            "milestones": [50000 * 18, 150000 * 18, 300000 * 18],
+            "gamma": 0.5,
+            "last_epoch": -1
+        },
     )
 
     model = GPTTrainer.init_from_config(config)
@@ -452,6 +1341,9 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
         eval_split_max_size=config.eval_split_max_size,
         eval_split_size=config.eval_split_size,
     )
+
+    # Update metrics with audio stats before training
+    #metrics.calculate_audio_stats(train_samples)
 
     trainer = Trainer(
         TrainerArgs(
@@ -464,7 +1356,20 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
         train_samples=train_samples,
         eval_samples=eval_samples,
     )
+    
+    # Train the model
     trainer.fit()
+
+    # # Update metrics after training
+    # metrics.end_time = time.time()
+    
+    # # Parse training logs
+    # log_file = Path(OUT_PATH) / "log.txt"
+    # if log_file.exists():
+        # metrics.update_from_log(log_file)
+    
+    # # Save metrics
+    # metrics.save(Path(output_path))
 
     del model, trainer, train_samples, eval_samples
     gc.collect()
@@ -524,102 +1429,161 @@ def optimize_model(out_path, base_model_path):
 
     return f"Model optimized and saved at {optimized_model}!", str(optimized_model)
 
-def copy_reference_samples(processed_dir, session_path):
+def copy_reference_samples(processed_dir, session_path, session_data):
     pandrator_voices_dir = Path("../Pandrator/tts_voices")
     if not pandrator_voices_dir.exists():
         print("Pandrator tts_voices directory does not exist. Skipping reference sample copying.")
         return
 
-    # Use the session folder name for the reference directory
+    # Get session name for file naming
     session_name = session_path.name
-    reference_dir = pandrator_voices_dir / session_name
-    reference_dir.mkdir(exist_ok=True)
 
-    # Get all wav files from the processed directory
-    wav_files = list(processed_dir.glob('*.wav'))
-    
+    # Get all wav files and their corresponding segments from session_data
+    wav_files = []
+    for wav_file in processed_dir.glob('*.wav'):
+        # Find corresponding text in session_data
+        segment = next((seg for seg in session_data['qualifying_segments'] 
+                       if Path(seg['audio_file']).name == wav_file.name), None)
+        if segment:
+            wav_files.append({
+                'path': wav_file,
+                'size': wav_file.stat().st_size,
+                'text': segment['text'],
+                'duration': AudioSegment.from_wav(wav_file).duration_seconds
+            })
+
     # Sort files by size in descending order
-    wav_files.sort(key=lambda x: x.stat().st_size, reverse=True)
+    wav_files.sort(key=lambda x: x['size'], reverse=True)
+
+    # Select one random file from top 10%
+    top_10_percent = wav_files[:max(1, len(wav_files) // 10)]
+    random_long = random.choice(top_10_percent)
     
-    # Select the top 10% largest files
-    top_10_percent = wav_files[:max(3, len(wav_files) // 10)]
+    # Copy the random long sample
+    shutil.copy2(random_long['path'], pandrator_voices_dir / f"{session_name}.wav")
+
+    # Get top 70% by length for speech rate calculation
+    top_70_percent = wav_files[:int(len(wav_files) * 0.7)]
     
-    # Randomly select 3 files from the top 10%
-    selected_files = random.sample(top_10_percent, min(3, len(top_10_percent)))
+    # Calculate speech rate (characters per second) for each file
+    for file in top_70_percent:
+        file['speech_rate'] = len(file['text']) / file['duration']
+
+    # Find the file with highest speech rate
+    fastest = max(top_70_percent, key=lambda x: x['speech_rate'])
     
-    # Copy selected files to the reference directory with new names
-    for i, file in enumerate(selected_files, start=1):
-        new_filename = f"{session_name}_{i}.wav"
-        shutil.copy2(file, reference_dir / new_filename)
-    
-    print(f"Copied {len(selected_files)} reference samples to {reference_dir}")
+    # Copy the fastest sample
+    shutil.copy2(fastest['path'], pandrator_voices_dir / f"{session_name}_fastest.wav")
+
+    print(f"Copied reference samples to {pandrator_voices_dir}:")
+    print(f"Long sample: {random_long['path'].name}")
+    print(f"Fastest sample: {fastest['path'].name} (speech rate: {fastest['speech_rate']:.2f} chars/sec)")
 
 def main():
-    args = parse_arguments()
-    session_path = create_session_folder(args.session)
-    log_file = create_log_file(session_path)
-    json_file = create_json_file(session_path)
+    try:
+        args = parse_arguments()
+        session_path = create_session_folder(args.session)
+        log_file = create_log_file(session_path)
+        json_file = create_json_file(session_path)
 
-    session_data = {'qualifying_segments': []}
+        session_data = {'qualifying_segments': []}
 
-    with open(json_file, 'w') as f:
-        json.dump(session_data, f)
-
-    audio_sources_dir = process_audio(args.input, session_path, args)
-
-    total_segments = 0
-    for audio_file in audio_sources_dir.glob('*.wav'):
-        json_file = transcribe_audio(audio_file, args, session_path)
-        segments_count = parse_transcription(json_file, audio_file, audio_sources_dir / "processed", session_data, args.sample_method)
-        total_segments += segments_count
-        print(f"Total qualifying segments after processing {audio_file.name}: {segments_count}")
-
-        # Save updated session_data to JSON file after each audio file
         with open(json_file, 'w') as f:
             json.dump(session_data, f)
 
-    print(f"Total qualifying segments across all files: {total_segments}")
+        # Process audio - this function now handles all audio preprocessing including
+        # normalization, de-essing, denoising, and compression
+        audio_sources_dir = process_audio(args.input, session_path, args)
 
-    train_csv, eval_csv = create_metadata_files(session_data, session_path)
+        total_segments = 0
+        for audio_file in audio_sources_dir.glob('*.wav'):
+            json_file = transcribe_audio(audio_file, args, session_path)
+            segments_count = parse_transcription(
+                json_file, 
+                audio_file, 
+                audio_sources_dir / "processed", 
+                session_data, 
+                args.sample_method,
+                args
+            )
+            total_segments += segments_count
+            print(f"Total qualifying segments after processing {audio_file.name}: {segments_count}")
 
-    if train_csv is None or eval_csv is None:
-        print("Failed to create metadata files. Exiting.")
-        return
+            # Save updated session_data to JSON file after each audio file
+            with open(json_file, 'w') as f:
+                json.dump(session_data, f)
 
-    models_dir = session_path / "models"
-    models_dir.mkdir(exist_ok=True)
+        print(f"Total qualifying segments across all files: {total_segments}")
 
-    model_name = args.xtts_model_name or f"xtts_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    model_output_path = models_dir / model_name
+        train_csv, eval_csv = create_metadata_files(
+            session_data, 
+            session_path,
+            args.training_proportion if hasattr(args, 'training_proportion') else 0.8  # Use new proportion if provided
+        )
 
-    base_model_path = os.path.join(Path.cwd(), "base_models", args.xtts_base_model)
-    download_models(base_model_path, args.xtts_base_model)
+        if train_csv is None or eval_csv is None:
+            print("Failed to create metadata files. Exiting.")
+            return
 
-    speaker_file, config_file, checkpoint_file, tokenizer_file, training_output_path = train_gpt(
-        custom_model="",
-        version=args.xtts_base_model,
-        language=args.source_language,
-        num_epochs=args.epochs,
-        batch_size=args.batch,
-        grad_acumm=args.gradient,
-        train_csv=str(train_csv),
-        eval_csv=str(eval_csv),
-        output_path=str(model_output_path)
-    )
+        # Clear GPU memory before training
+        print("\nClearing GPU memory before training...")
+        if torch.cuda.is_available():
+            # Clear CUDA cache
+            torch.cuda.empty_cache()
+            # Reset peak memory stats
+            torch.cuda.reset_peak_memory_stats()
+            # Force garbage collection
+            gc.collect()
+            # Clear cache again
+            torch.cuda.empty_cache()
+            
+            # Print memory stats
+            print("GPU Memory Status after clearing:")
+            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"Cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB\n")
 
-    optimization_message, optimized_model_path = optimize_model(model_output_path, base_model_path)
+        models_dir = session_path / "models"
+        models_dir.mkdir(exist_ok=True)
 
-    print(f"Training completed. Model saved at: {model_output_path}")
-    print(optimization_message)
-    print(f"Optimized model path: {optimized_model_path}")
+        model_name = args.xtts_model_name or f"xtts_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        model_output_path = models_dir / model_name
 
-    if optimized_model_path:  # This ensures the optimization was successful
-        copy_reference_samples(audio_sources_dir / "processed", session_path)
-        print("Reference samples copied successfully.")
-    else:
-        print("Warning: Optimized model path not found. Reference samples not copied.")
+        base_model_path = os.path.join(Path.cwd(), "base_models", args.xtts_base_model)
+        download_models(base_model_path, args.xtts_base_model)
 
-    return True  # Indicate successful completion
+        speaker_file, config_file, checkpoint_file, tokenizer_file, training_output_path = train_gpt(
+            custom_model="",
+            version=args.xtts_base_model,
+            language=args.source_language,
+            num_epochs=args.epochs,
+            batch_size=args.batch,
+            grad_acumm=args.gradient,
+            train_csv=str(train_csv),
+            eval_csv=str(eval_csv),
+            output_path=str(model_output_path),
+            sample_rate=args.sample_rate,
+            model_name=model_name,
+            max_audio_time=args.max_audio_time,
+            max_text_length=args.max_text_length
+        )
+
+        optimization_message, optimized_model_path = optimize_model(model_output_path, base_model_path)
+
+        print(f"Training completed. Model saved at: {model_output_path}")
+        print(optimization_message)
+        print(f"Optimized model path: {optimized_model_path}")
+
+        if optimized_model_path:  
+            copy_reference_samples(audio_sources_dir / "processed", session_path, session_data)
+            print("Reference samples copied successfully.")
+        else:
+            print("Warning: Optimized model path not found. Reference samples not copied.")
+
+        return True  # Indicate successful completion
+
+    except Exception as e:
+        print(f"An unexpected error occurred: {str(e)}")
+        return False
 
 if __name__ == "__main__":
     try:
