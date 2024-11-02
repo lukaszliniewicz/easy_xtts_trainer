@@ -2,13 +2,14 @@ coqui-tts
 pydub
 tqdm
 requests
-numpy
+numpy 
 scipy
 soundfile
 librosa
 unidecode
 inflect
 PyYAML
+torch
 torchaudio
 tensorboardX
 matplotlib
@@ -20,3 +21,4 @@ transformers
 encodec
 progressbar2
 nltk
+deepfilter
