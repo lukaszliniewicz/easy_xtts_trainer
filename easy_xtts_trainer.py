@@ -629,10 +629,6 @@ def parse_arguments():
                        help="For mixed method, proportion of maximise-punctuation to punctuation-only (e.g., '6_4' for 60-40 split)")
     parser.add_argument("--training-proportion", default="8_2",
                        help="Proportion of training to validation data (e.g., '8_2' for 80-20 split)")
-    #parser.add_argument("--vad_onset", type=float, default=0.5,
-                       help="VAD onset threshold for WhisperX (default: 0.5)")
-    #parser.add_argument("--vad_offset", type=float, default=0.3,
-                       help="VAD offset threshold for WhisperX (default: 0.3)")
     
     args = parser.parse_args()
     
