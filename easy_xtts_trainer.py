@@ -32,7 +32,7 @@ from df.enhance import enhance, init_df, load_audio, save_audio
 import soundfile as sf
 import librosa
 
-conda_path = Path("../conda/Scripts/conda.exe")
+conda_path = Path("../d/conda/Scripts/conda.exe")
 
 class AudioProcessor:
     def __init__(self, target_sr: int = 22050):
@@ -177,65 +177,99 @@ class AudioProcessor:
     def find_optimal_cut_points(self, segments: List[Dict], audio: AudioSegment) -> List[Dict[str, Tuple[float, Optional[float], Optional[float]]]]:
         """
         Find optimal cut points between segments by analyzing the quietest point 
-        between contextual words and segments. 
-        Adjusts the start and end by +-200ms from boundaries.
-        
-        Return a more detailed dictionary containing the cut points:
-        [{'start': ..., 'end': ..., 'prev_word_end': ..., 'next_word_start': ... }]
+        between contextual words and segments.
         """
         if not segments:
             return []
             
         cut_points = []
         audio_length_sec = len(audio) / 1000  # Convert to seconds
+        max_window = 0.4  # Maximum 400ms window for finding cut points
         
-        for i in range(len(segments)):
-            curr_segment = segments[i]
-            curr_first_word = next((w for w in curr_segment["words"] if "start" in w), None)
-            curr_last_word = next((w for w in reversed(curr_segment["words"]) if "end" in w), None)
+        # Create debug log file in the same directory as the audio
+        debug_log_path = Path(segments[0]['words'][0].get('audio_file', 'debug')).parent / 'cut_points_debug.log'
+        
+        with open(debug_log_path, 'w', encoding='utf-8') as debug_log:
+            debug_log.write("Cut Points Analysis Debug Log\n")
+            debug_log.write("===========================\n\n")
             
-            if not curr_first_word or not curr_last_word:
-                continue
-                    
-            # Context - previous word's end time and next word's start time
-            prev_word_end = None
-            next_word_start = None
+            for i in range(len(segments)):
+                curr_segment = segments[i]
+                curr_first_word = next((w for w in curr_segment["words"] if "start" in w), None)
+                curr_last_word = next((w for w in reversed(curr_segment["words"]) if "end" in w), None)
                 
-            # Default to 200ms window before/after if no timestamps exist for prior/next words.
-            if i > 0:
-                prev_segment = segments[i-1]
-                prev_last_word = next((w for w in reversed(prev_segment["words"]) if "end" in w), None)
-                if prev_last_word:
-                    prev_word_end = prev_last_word["end"]
+                if not curr_first_word or not curr_last_word:
+                    debug_log.write(f"\nSkipping segment {i} - Missing word timestamps\n")
+                    continue
+                    
+                # Log current segment details
+                debug_log.write(f"\n=== Segment {i} ===\n")
+                debug_log.write(f"Text: {' '.join(w['word'] for w in curr_segment['words'])}\n")
+                debug_log.write(f"First word: '{curr_first_word['word']}' at {curr_first_word['start']:.3f}s\n")
+                debug_log.write(f"Last word: '{curr_last_word['word']}' at {curr_last_word['end']:.3f}s\n")
+                
+                # Context - previous word's end time and next word's start time
+                prev_word_end = None
+                next_word_start = None
+                
+                # Get previous segment info
+                if i > 0:
+                    prev_segment = segments[i-1]
+                    prev_last_word = next((w for w in reversed(prev_segment["words"]) if "end" in w), None)
+                    if prev_last_word:
+                        prev_word_end = prev_last_word["end"]
+                        debug_log.write(f"Previous segment last word: '{prev_last_word['word']}' ending at {prev_word_end:.3f}s\n")
+                    else:
+                        prev_word_end = max(0, curr_first_word["start"] - max_window/2)
+                        debug_log.write(f"No previous word found, using {prev_word_end:.3f}s ({max_window/2*1000}ms before current)\n")
                 else:
-                    prev_word_end = max(0, curr_first_word["start"] - 0.2)  # Default to 200ms before
-            else:
-                # If this is the first segment, look 200ms before.
-                prev_word_end = max(0, curr_first_word["start"] - 0.2)
-            
-            if i < len(segments) - 1:
-                next_segment = segments[i+1]
-                next_first_word = next((w for w in next_segment["words"] if "start" in w), None)
-                if next_first_word:
-                    next_word_start = next_first_word["start"]
+                    prev_word_end = max(0, curr_first_word["start"] - max_window/2)
+                    debug_log.write(f"First segment - using {prev_word_end:.3f}s ({max_window/2*1000}ms before start)\n")
+                
+                # Get next segment info
+                if i < len(segments) - 1:
+                    next_segment = segments[i+1]
+                    next_first_word = next((w for w in next_segment["words"] if "start" in w), None)
+                    if next_first_word:
+                        next_word_start = next_first_word["start"]
+                        debug_log.write(f"Next segment first word: '{next_first_word['word']}' starting at {next_word_start:.3f}s\n")
+                    else:
+                        next_word_start = min(audio_length_sec, curr_last_word["end"] + max_window/2)
+                        debug_log.write(f"No next word found, using {next_word_start:.3f}s ({max_window/2*1000}ms after current)\n")
                 else:
-                    next_word_start = min(audio_length_sec, curr_last_word["end"] + 0.2)  # Look 200ms after
-            else:
-                # If this is the last segment, look 200ms after.
-                next_word_start = min(audio_length_sec, curr_last_word["end"] + 0.2)
-            
-            # Find quietest point between prev segment's end and current first word
-            start_time = self.find_lowest_energy_point(audio, prev_word_end, curr_first_word["start"])
-            
-            # Find quietest point between curr last word and the next word's start
-            end_time = self.find_lowest_energy_point(audio, curr_last_word["end"], next_word_start)
-            
-            cut_points.append({
-                "start": start_time,
-                "end": end_time,
-                "prev_word_end": prev_word_end,
-                "next_word_start": next_word_start
-            })
+                    next_word_start = min(audio_length_sec, curr_last_word["end"] + max_window/2)
+                    debug_log.write(f"Last segment - using {next_word_start:.3f}s ({max_window/2*1000}ms after end)\n")
+                
+                # Find optimal cut points with limited windows
+                debug_log.write("\nFinding optimal cut points:\n")
+                
+                # Calculate start window
+                start_search_end = curr_first_word["start"]
+                start_search_start = max(prev_word_end, start_search_end - max_window)
+                debug_log.write(f"Start window: {start_search_start:.3f}s to {start_search_end:.3f}s\n")
+                
+                start_time = self.find_lowest_energy_point(audio, start_search_start, start_search_end)
+                debug_log.write(f"-> Found optimal start at: {start_time:.3f}s\n")
+                
+                # Calculate end window
+                end_search_start = curr_last_word["end"]
+                end_search_end = min(next_word_start, end_search_start + max_window)
+                debug_log.write(f"End window: {end_search_start:.3f}s to {end_search_end:.3f}s\n")
+                
+                end_time = self.find_lowest_energy_point(audio, end_search_start, end_search_end)
+                debug_log.write(f"-> Found optimal end at: {end_time:.3f}s\n")
+                
+                cut_points.append({
+                    "start": start_time,
+                    "end": end_time,
+                    "prev_word_end": prev_word_end,
+                    "next_word_start": next_word_start
+                })
+                
+                debug_log.write(f"\nFinal cut points for segment {i}:\n")
+                debug_log.write(f"Start: {start_time:.3f}s (window was {start_search_start:.3f}s - {start_search_end:.3f}s)\n")
+                debug_log.write(f"End: {end_time:.3f}s (window was {end_search_start:.3f}s - {end_search_end:.3f}s)\n")
+                debug_log.write("=" * 50 + "\n")
         
         return cut_points
 
@@ -595,6 +629,10 @@ def parse_arguments():
                        help="For mixed method, proportion of maximise-punctuation to punctuation-only (e.g., '6_4' for 60-40 split)")
     parser.add_argument("--training-proportion", default="8_2",
                        help="Proportion of training to validation data (e.g., '8_2' for 80-20 split)")
+    #parser.add_argument("--vad_onset", type=float, default=0.5,
+                       help="VAD onset threshold for WhisperX (default: 0.5)")
+    #parser.add_argument("--vad_offset", type=float, default=0.3,
+                       help="VAD offset threshold for WhisperX (default: 0.3)")
     
     args = parser.parse_args()
     
@@ -756,8 +794,6 @@ def process_audio(input_path, session_path, args):
 
     return audio_sources_dir
 
-
-
 def save_segment(audio: AudioSegment, 
                 start_ms: int, 
                 end_ms: int, 
@@ -886,63 +922,100 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data,
             }
         
         segments_processed = 0
-        words_to_process = current_segment["words"] if current_segment["words"] else all_words
-        
-        i = 0
-        while i < len(words_to_process):
-            word = words_to_process[i]
+        try:
+            words_to_process = current_segment["words"]
             
-            # Check if current word has valid timestamps
-            if not is_valid_timestamps(word):
-                # If word has punctuation, we need to handle backtracking
-                if any(p in word['word'] for p in '.!?;,-'):
-                    if current_segment["words"]:
-                        # Try to build new segment from current segment's start up to last valid break
-                        last_valid_break = None
-                        current_duration = 0
+            i = 0
+            while i < len(words_to_process):
+                word = words_to_process[i]
+                
+                # Check if current word has valid timestamps
+                if not is_valid_timestamps(word):
+                    # If word has punctuation, we need to handle backtracking
+                    if any(p in word['word'] for p in '.!?;,-'):
+                        if current_segment["words"]:
+                            # Try to build new segment from current segment's start up to last valid break
+                            last_valid_break = None
+                            current_duration = 0
+                            
+                            for idx, w in enumerate(current_segment["words"]):
+                                if is_valid_timestamps(w):
+                                    if any(p in w['word'] for p in '.!?;,-'):
+                                        if not is_abbreviation(w['word'], len(w['word'])-1):
+                                            temp_duration = calculate_segment_duration(current_segment["words"][:idx + 1])
+                                            if temp_duration <= args.max_audio_time:
+                                                last_valid_break = idx
+                                                current_duration = temp_duration
+                            
+                            if last_valid_break is not None:
+                                # Add segment to pending instead of saving immediately
+                                valid_segment = current_segment["words"][:last_valid_break + 1]
+                                pending_segments.append({
+                                    "words": valid_segment,
+                                    "text": " ".join(w['word'] for w in valid_segment)
+                                })
+                                segments_processed += 1
                         
-                        for idx, w in enumerate(current_segment["words"]):
-                            if is_valid_timestamps(w):
-                                if any(p in w['word'] for p in '.!?;,-'):
-                                    if not is_abbreviation(w['word'], len(w['word'])-1):
-                                        temp_duration = calculate_segment_duration(current_segment["words"][:idx + 1])
-                                        if temp_duration <= args.max_audio_time:
-                                            last_valid_break = idx
-                                            current_duration = temp_duration
+                        # Whether we saved a segment or not, find next valid starting point
+                        next_valid_idx = None
+                        for j in range(i + 1, len(words_to_process)):
+                            if (is_valid_timestamps(words_to_process[j]) and 
+                                any(p in words_to_process[j]['word'] for p in '.!?;,-')):
+                                next_valid_idx = j
+                                break
                         
-                        if last_valid_break is not None:
-                            # Add segment to pending instead of saving immediately
-                            valid_segment = current_segment["words"][:last_valid_break + 1]
-                            pending_segments.append({
-                                "words": valid_segment,
-                                "text": " ".join(w['word'] for w in valid_segment)
-                            })
-                            segments_processed += 1
-                    
-                    # Whether we saved a segment or not, find next valid starting point
-                    next_valid_idx = None
-                    for j in range(i + 1, len(words_to_process)):
-                        if (is_valid_timestamps(words_to_process[j]) and 
-                            any(p in words_to_process[j]['word'] for p in '.!?;,-')):
-                            next_valid_idx = j
+                        if next_valid_idx:
+                            i = next_valid_idx + 1
+                            current_segment["words"] = []
+                            current_segment["text"] = ""
+                            current_segment["break_points"] = []
+                            continue
+                        else:
                             break
                     
-                    if next_valid_idx:
-                        i = next_valid_idx + 1
-                        current_segment["words"] = []
-                        current_segment["text"] = ""
-                        current_segment["break_points"] = []
-                        continue
-                    else:
-                        break
+                    # Skip words without timestamps
+                    i += 1
+                    continue
+                # Before adding word, check if current segment already exceeds limits
+                if current_segment["words"]:
+                    current_duration = calculate_segment_duration(current_segment["words"])
+                    if current_duration > args.max_audio_time:
+                        if current_segment["break_points"]:
+                            optimal_break = current_segment["break_points"][-1]
+                            pending_segments.append({
+                                "words": optimal_break["words"],
+                                "text": optimal_break["text"]
+                            })
+                            segments_processed += 1
+                            # Reset segment
+                            current_segment["words"] = []
+                            current_segment["text"] = ""
+                            current_segment["break_points"] = []
+                        else:
+                            # If no valid breaks, reset and continue
+                            current_segment["words"] = []
+                            current_segment["text"] = ""
+                            current_segment["break_points"] = []
                 
-                # Skip words without timestamps
-                i += 1
-                continue
- # Before adding word, check if current segment already exceeds limits
-            if current_segment["words"]:
-                current_duration = calculate_segment_duration(current_segment["words"])
-                if current_duration > args.max_audio_time:
+                # Add word to current segment
+                current_segment["words"].append(word)
+                current_segment["text"] += " " + word['word']
+                
+                duration = calculate_segment_duration(current_segment["words"])
+                text_length = len(current_segment["text"])
+                
+                # Check if this word creates a potential break point
+                if any(p in word['word'] for p in '.!?;,-'):
+                    if not is_abbreviation(word['word'], len(word['word'])-1):
+                        if duration <= args.max_audio_time and text_length <= args.max_text_length:
+                            current_segment["break_points"].append({
+                                "words": current_segment["words"].copy(),
+                                "text": current_segment["text"],
+                                "duration": duration
+                            })
+                
+                # Check if we've exceeded limits
+                if duration > args.max_audio_time or text_length > args.max_text_length:
                     if current_segment["break_points"]:
                         optimal_break = current_segment["break_points"][-1]
                         pending_segments.append({
@@ -950,128 +1023,100 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data,
                             "text": optimal_break["text"]
                         })
                         segments_processed += 1
-                        # Reset segment
-                        current_segment["words"] = []
-                        current_segment["text"] = ""
+                        # Reset segment with remaining words
+                        break_word_index = current_segment["words"].index(optimal_break["words"][-1])
+                        current_segment["words"] = current_segment["words"][break_word_index + 1:]
+                        current_segment["text"] = " ".join(word['word'] for word in current_segment["words"])
                         current_segment["break_points"] = []
                     else:
                         # If no valid breaks, reset and continue
                         current_segment["words"] = []
                         current_segment["text"] = ""
                         current_segment["break_points"] = []
+                
+                i += 1
             
-            # Add word to current segment
-            current_segment["words"].append(word)
-            current_segment["text"] += " " + word['word']
+            # Process any remaining segment
+            if current_segment["words"] and current_segment["break_points"]:
+                optimal_break = current_segment["break_points"][-1]
+                pending_segments.append({
+                    "words": optimal_break["words"],
+                    "text": optimal_break["text"]
+                })
+                segments_processed += 1
             
-            duration = calculate_segment_duration(current_segment["words"])
-            text_length = len(current_segment["text"])
+            return segments_processed
+        except Exception as e:
+            print(f"Error in maximise_punctuation: {str(e)}")
+            return 0
             
-            # Check if this word creates a potential break point
-            if any(p in word['word'] for p in '.!?;,-'):
-                if not is_abbreviation(word['word'], len(word['word'])-1):
-                    if duration <= args.max_audio_time and text_length <= args.max_text_length:
-                        current_segment["break_points"].append({
-                            "words": current_segment["words"].copy(),
-                            "text": current_segment["text"],
-                            "duration": duration
-                        })
-            
-            # Check if we've exceeded limits
-            if duration > args.max_audio_time or text_length > args.max_text_length:
-                if current_segment["break_points"]:
-                    optimal_break = current_segment["break_points"][-1]
-                    pending_segments.append({
-                        "words": optimal_break["words"],
-                        "text": optimal_break["text"]
-                    })
-                    segments_processed += 1
-                    # Reset segment with remaining words
-                    break_word_index = current_segment["words"].index(optimal_break["words"][-1])
-                    current_segment["words"] = current_segment["words"][break_word_index + 1:]
-                    current_segment["text"] = " ".join(word['word'] for word in current_segment["words"])
-                    current_segment["break_points"] = []
-                else:
-                    # If no valid breaks, reset and continue
-                    current_segment["words"] = []
-                    current_segment["text"] = ""
-                    current_segment["break_points"] = []
-            
-            i += 1
-        
-        # Process any remaining segment
-        if current_segment["words"] and current_segment["break_points"]:
-            optimal_break = current_segment["break_points"][-1]
-            pending_segments.append({
-                "words": optimal_break["words"],
-                "text": optimal_break["text"]
-            })
-            segments_processed += 1
-        
-        return segments_processed
-
     def process_punctuation_only(current_segment=None):
         segments_processed = 0
-        current_words = current_segment["words"] if current_segment else []
-        i = 0
-        
-        while i < len(all_words):
-            word = all_words[i]
+        try:
+            current_words = current_segment["words"] if current_segment else []
+            i = 0
             
-            if not is_valid_timestamps(word):
-                if any(p in word['word'] for p in '.!?;,-'):
-                    # Try to extend to next punctuation mark
-                    next_break_idx = find_next_valid_break(all_words, i + 1)
-                    if next_break_idx:
-                        # Check if extended segment would be within limits
-                        potential_segment = current_words + all_words[i:next_break_idx + 1]
-                        duration = calculate_segment_duration(potential_segment)
-                        text_length = len(" ".join(w['word'] for w in potential_segment))
-                        
-                        if duration <= args.max_audio_time and text_length <= args.max_text_length:
-                            if duration >= 2.0:  # Minimum duration check
-                                pending_segments.append({
-                                    "words": potential_segment,
-                                    "text": " ".join(w['word'] for w in potential_segment)
-                                })
-                                segments_processed += 1
-                                current_words = []
-                                i = next_break_idx + 1
-                                continue
-                    
-                    # If extension failed, start fresh from next valid break
-                    next_start = find_next_valid_break(all_words, i + 1)
-                    if next_start:
-                        i = next_start
-                        current_words = []
-                    else:
-                        break
-                i += 1
-                continue
-            
-            current_words.append(word)
-            
-            if len(current_words) >= 2:
-                duration = calculate_segment_duration(current_words)
-                current_text = " ".join(w['word'] for w in current_words)
+            words_to_process = current_segment["words"] if current_segment else []
+            while i < len(words_to_process):  
+                word = words_to_process[i]
                 
-                if duration > args.max_audio_time or len(current_text) > args.max_text_length:
-                    current_words = [word]
+                if not is_valid_timestamps(word):
+                    if any(p in word['word'] for p in '.!?;,-'):
+                        # Try to extend to next punctuation mark
+                        next_break_idx = find_next_valid_break(all_words, i + 1)
+                        if next_break_idx:
+                            # Check if extended segment would be within limits
+                            potential_segment = current_words + all_words[i:next_break_idx + 1]
+                            duration = calculate_segment_duration(potential_segment)
+                            text_length = len(" ".join(w['word'] for w in potential_segment))
+                            
+                            if duration <= args.max_audio_time and text_length <= args.max_text_length:
+                                if duration >= 2.0:  # Minimum duration check
+                                    pending_segments.append({
+                                        "words": potential_segment,
+                                        "text": " ".join(w['word'] for w in potential_segment)
+                                    })
+                                    segments_processed += 1
+                                    current_words = []
+                                    i = next_break_idx + 1
+                                    continue
+                        
+                        # If extension failed, start fresh from next valid break
+                        next_start = find_next_valid_break(all_words, i + 1)
+                        if next_start:
+                            i = next_start
+                            current_words = []
+                        else:
+                            break
+                    i += 1
                     continue
                 
-                if duration >= 2.0 and any(p in word['word'] for p in '.!?;,-'):
-                    if not is_abbreviation(word['word'], len(word['word'])-1):
-                        pending_segments.append({
-                            "words": current_words,
-                            "text": current_text
-                        })
-                        segments_processed += 1
-                        current_words = []
+                current_words.append(word)
+                
+                if len(current_words) >= 2:
+                    duration = calculate_segment_duration(current_words)
+                    current_text = " ".join(w['word'] for w in current_words)
+                    
+                    if duration > args.max_audio_time or len(current_text) > args.max_text_length:
+                        current_words = [word]
+                        continue
+                    
+                    if duration >= 2.0 and any(p in word['word'] for p in '.!?;,-'):
+                        if not is_abbreviation(word['word'], len(word['word'])-1):
+                            pending_segments.append({
+                                "words": current_words,
+                                "text": current_text
+                            })
+                            segments_processed += 1
+                            current_words = []
+                
+                i += 1
             
-            i += 1
-        
-        return segments_processed
-
+            return segments_processed
+        except Exception as e:
+            print(f"Error in process_punctuation_only: {str(e)}")
+            return 0
+            
     def process_mixed(method_proportion=0.6):
         if not all_words:
             return 0
