@@ -32,7 +32,7 @@ from df.enhance import enhance, init_df, load_audio, save_audio
 import soundfile as sf
 import librosa
 
-conda_path = Path("../d/conda/Scripts/conda.exe")
+conda_path = Path("../conda/Scripts/conda.exe")
 
 class AudioProcessor:
     def __init__(self, target_sr: int = 22050):
