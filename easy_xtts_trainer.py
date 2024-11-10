@@ -194,7 +194,7 @@ class AudioProcessor:
             
         cut_points = []
         audio_length_sec = len(audio) / 1000  # Convert to seconds
-        max_window = 0.4  # Maximum 400ms window for finding cut points
+        max_window = 0.5  # Maximum 400ms window for finding cut points
         
         # Create debug log file in the same directory as the audio
         debug_log_path = Path(segments[0]['words'][0].get('audio_file', 'debug')).parent / 'cut_points_debug.log'
@@ -322,9 +322,16 @@ class AudioProcessor:
                     # Adjust the last word's end time
                     last_word = segment['words'][-1].copy()  # Copy to avoid modifying original
                     if 'end' in last_word:
+                        # Check if word ends with sentence-final punctuation
+                        base_offset = args.negative_offset_last_word / 1000  # Convert ms to seconds
+                        if any(last_word['word'].strip().endswith(p) for p in '.!?'):
+                            offset = base_offset * 2  # 1.5x offset for sentence endings
+                        else:
+                            offset = base_offset  # Normal offset for other words
+                            
                         last_word['end'] = max(
                             last_word['start'],  # Don't let end time go before start time
-                            last_word['end'] - (args.negative_offset_last_word / 1000)  # Convert ms to seconds
+                            last_word['end'] - offset  # Apply the calculated offset
                         )
                     adjusted_segment['words'].append(last_word)
                     adjusted_segments.append(adjusted_segment)
@@ -700,9 +707,8 @@ def parse_arguments():
         except (ValueError, AttributeError):
             raise ValueError("Training proportion must be in format 'N_M' where N+M=10 (e.g., '8_2')")
     
-    # Set default negative offset for Polish if not explicitly provided
     if args.negative_offset_last_word is None:
-        args.negative_offset_last_word = 100 if args.source_language == "pl" else 0
+        args.negative_offset_last_word = 0 if args.source_language == "en" else 100
     
     return args
 
