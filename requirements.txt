@@ -2,15 +2,15 @@ coqui-tts
 pydub
 tqdm
 requests
-numpy 
+numpy<2
 scipy
 soundfile
 librosa
 unidecode
 inflect
 PyYAML
-torch
-torchaudio
+torch==2.2.0
+torchaudio==2.2.0
 tensorboardX
 matplotlib
 Pillow
@@ -22,3 +22,4 @@ encodec
 progressbar2
 nltk
 deepfilternet
+git+https://github.com/lukaszliniewicz/breath-removal.git
