@@ -85,6 +85,114 @@ class AudioProcessor:
         self.segment_window_ms = 200  # Window for finding cut points
         self.analysis_window_ms = 2  # Window for energy analysis
 
+    def apply_fades(self, audio: np.ndarray, sr: int, fade_in_ms: Optional[int] = None, 
+                    fade_out_ms: Optional[int] = None) -> np.ndarray:
+        """
+        Apply fade-in and/or fade-out effects to audio.
+        
+        Args:
+            audio: Input audio array
+            sr: Sample rate
+            fade_in_ms: Duration of fade-in in milliseconds
+            fade_out_ms: Duration of fade-out in milliseconds
+        Returns:
+            Audio with fades applied
+        """
+        try:
+            # Make a copy to avoid modifying the original array
+            audio = audio.copy()
+            
+            # Convert ms to samples
+            fade_in_samples = int((fade_in_ms / 1000) * sr) if fade_in_ms else 0
+            fade_out_samples = int((fade_out_ms / 1000) * sr) if fade_out_ms else 0
+            
+            # Apply fade-in
+            if fade_in_samples > 0:
+                if fade_in_samples >= len(audio):
+                    fade_in_samples = len(audio) // 2  # Limit to half the audio length
+                fade_in = np.linspace(0, 1, fade_in_samples)
+                audio[:fade_in_samples] *= fade_in
+            
+            # Apply fade-out
+            if fade_out_samples > 0:
+                if fade_out_samples >= len(audio):
+                    fade_out_samples = len(audio) // 2  # Limit to half the audio length
+                fade_out = np.linspace(1, 0, fade_out_samples)
+                audio[-fade_out_samples:] *= fade_out
+            
+            return audio
+            
+        except Exception as e:
+            print(f"Error applying fades: {str(e)}")
+            return audio
+
+    def remove_trailing_silence(self, audio: np.ndarray, sr: int) -> np.ndarray:
+        """
+        Remove trailing silence using a robust multi-stage approach.
+        
+        Args:
+            audio: Input audio array
+            sr: Sample rate
+        Returns:
+            Trimmed audio array with trailing silence removed
+        """
+        try:
+            # Ensure minimum audio length
+            if len(audio) < sr // 2:  # Less than 500ms
+                return audio
+                
+            # Stage 1: Calculate energy profile
+            window_size = sr // 50  # 20ms windows
+            energy_profile = []
+            
+            for i in range(0, len(audio), window_size):
+                window = audio[i:min(i + window_size, len(audio))]
+                rms = np.sqrt(np.mean(window**2))
+                energy_db = 20 * np.log10(max(rms, 1e-10))
+                energy_profile.append(energy_db)
+                
+            energy_profile = np.array(energy_profile)
+            
+            # Stage 2: Calculate adaptive threshold
+            non_silent = energy_profile[energy_profile > -60]
+            if len(non_silent) == 0:
+                return audio
+                
+            base_threshold = np.percentile(non_silent, 10) - 15
+            
+            # Stage 3: Find significant energy drops
+            diff_profile = np.diff(energy_profile)
+            window_count = len(energy_profile)
+            
+            # Look for the last significant sound
+            last_significant_idx = window_count - 1
+            min_silence_windows = sr // (window_size * 2)  # 500ms minimum
+            
+            for i in range(window_count - min_silence_windows - 1, 0, -1):
+                current_energy = energy_profile[i]
+                future_energy = energy_profile[i:i + min_silence_windows]
+                
+                # Check if we've found the last significant sound
+                if current_energy > base_threshold and np.all(future_energy < base_threshold):
+                    last_significant_idx = i
+                    break
+            
+            # Stage 4: Apply safety margin and fade out
+            end_sample = min(len(audio), (last_significant_idx + 1) * window_size + sr//10)  # Add 100ms safety
+            
+            # Apply fade out
+            fade_length = min(sr//50, len(audio) - end_sample)  # 20ms fade
+            if fade_length > 0:
+                fade = np.linspace(1, 0, fade_length)
+                audio[end_sample:end_sample + fade_length] *= fade
+                end_sample += fade_length
+            
+            return audio[:end_sample]
+            
+        except Exception as e:
+            print(f"Error in remove_trailing_silence: {str(e)}")
+            return audio
+
     def find_lowest_energy_point(self, audio: AudioSegment, start_time: float, end_time: float) -> float:
         """
         Find the quietest point by dividing window into subwindows and selecting the middle
@@ -299,48 +407,127 @@ class AudioProcessor:
         
         return cut_points
 
+    def check_for_abrupt_ending(self, audio: np.ndarray, sr: int, threshold_ms: int = 50) -> bool:
+        """
+        Check if audio segment ends abruptly using multiple factors with more sensitive thresholds.
+        """
+        try:
+            # Convert audio to float32 and normalize
+            if audio.dtype != np.float32:
+                audio = audio.astype(np.float32)
+            if np.max(np.abs(audio)) > 1.0:
+                audio = audio / np.max(np.abs(audio))
+            
+            # Analyze the final portion of audio
+            tail_ms = 100  # Look at final 100ms
+            tail_samples = min(int((tail_ms / 1000) * sr), len(audio) // 3)
+            tail = audio[-tail_samples:]
+            
+            # Calculate RMS energy in small windows
+            window_ms = 5  # 5ms windows for finer resolution
+            window_size = int((window_ms / 1000) * sr)
+            windows = np.array_split(tail, tail_samples // window_size)
+            energy = np.array([np.sqrt(np.mean(w**2)) for w in windows])
+            
+            # Calculate metrics
+            end_energy = np.mean(energy[-3:])
+            peak_energy = np.max(energy)
+            energy_ratio = end_energy / peak_energy
+            
+            # Calculate energy slope at the end
+            if len(energy) >= 4:
+                end_slope = (energy[-1] - energy[-4]) / 3
+            else:
+                end_slope = 0
+                
+            # Zero-crossing analysis
+            zcr_windows = np.array_split(tail, 4)
+            zcr_rates = [np.sum(np.abs(np.diff(np.signbit(w)))) / len(w) for w in zcr_windows]
+            zcr_variance = np.var(zcr_rates)
+            zcr_change = abs(zcr_rates[-1] - np.mean(zcr_rates[:-1])) if len(zcr_rates) > 1 else 0
+            
+            # Check for sudden amplitude drop
+            amplitude_envelope = np.abs(tail)
+            final_samples = amplitude_envelope[-int(0.01 * sr):]  # Last 10ms
+            sudden_drop = np.mean(final_samples) < 0.1 * np.mean(amplitude_envelope)
+            
+            # More sensitive thresholds
+            is_abrupt = (
+                (energy_ratio > 0.5 or  # Energy doesn't drop enough
+                 end_slope > 0 or       # Energy increases at the end
+                 zcr_variance > 0.05 or # Irregular zero crossings
+                 zcr_change > 0.3 or    # Sudden change in zero-crossing rate
+                 sudden_drop)           # Sudden amplitude drop
+                and
+                end_energy > 0.1        # Ensure there's significant energy at the end
+            )
+            
+            # Print detailed analysis if it's abrupt
+            if is_abrupt:
+                print("\nAbrupt ending detected:")
+                print(f"Energy ratio: {energy_ratio:.3f} (> 0.5 suggests abrupt)")
+                print(f"End slope: {end_slope:.3f} (positive suggests abrupt)")
+                print(f"ZCR variance: {zcr_variance:.3f} (> 0.05 suggests abrupt)")
+                print(f"ZCR change: {zcr_change:.3f} (> 0.3 suggests abrupt)")
+                print(f"Sudden drop: {sudden_drop}")
+                print(f"End energy: {end_energy:.3f}")
+                
+            return is_abrupt
+            
+        except Exception as e:
+            print(f"Error in check_for_abrupt_ending: {str(e)}")
+            print(f"Audio shape: {audio.shape if isinstance(audio, np.ndarray) else 'invalid'}")
+            print(f"Audio type: {audio.dtype if isinstance(audio, np.ndarray) else 'invalid'}")
+            return False
+        
+    def _calculate_zcr_variance(self, audio: np.ndarray) -> float:
+        """Calculate zero-crossing rate variance with adaptive windowing."""
+        window_size = len(audio) // 4
+        zcr_groups = [
+            np.sum(np.abs(np.diff(np.signbit(g)))) / len(g)
+            for g in np.array_split(audio, max(4, len(audio) // window_size))
+        ]
+        return np.var(zcr_groups)
 
     def process_segments(self, input_path: str, segments: List[Dict], output_dir: Path, args) -> List[Dict[str, str]]:
-        """
-        Process audio segments with optimal cut points and apply audio processing.
-        Use the context around segment boundaries for cleaner cutting.
-        """
         try:
             # Load audio file
             audio = AudioSegment.from_wav(input_path)
             
-            # Apply negative offset to last words before finding cut points
+            # Track statistics for final report
+            total_segments = len(segments)
+            discarded_segments = []
+            
+            # Apply negative offset to last words
             adjusted_segments = []
             for segment in segments:
                 if segment['words']:
-                    # Create a deep copy of the segment to avoid modifying original
+                    # Create a deep copy of the segment
                     adjusted_segment = {
                         'words': segment['words'][:-1],  # All words except last
                         'text': segment['text']
                     }
                     
                     # Adjust the last word's end time
-                    last_word = segment['words'][-1].copy()  # Copy to avoid modifying original
+                    last_word = segment['words'][-1].copy()
                     if 'end' in last_word:
-                        # Check if word ends with sentence-final punctuation
-                        base_offset = args.negative_offset_last_word / 1000  # Convert ms to seconds
+                        base_offset = args.negative_offset_last_word / 1000
                         if any(last_word['word'].strip().endswith(p) for p in '.!?'):
-                            offset = base_offset * 2  # 1.5x offset for sentence endings
+                            offset = base_offset * 2
                         else:
-                            offset = base_offset  # Normal offset for other words
+                            offset = base_offset
                             
                         last_word['end'] = max(
-                            last_word['start'],  # Don't let end time go before start time
-                            last_word['end'] - offset  # Apply the calculated offset
+                            last_word['start'],
+                            last_word['end'] - offset
                         )
                     adjusted_segment['words'].append(last_word)
                     adjusted_segments.append(adjusted_segment)
             
-            # Find optimal cut points using adjusted segments
             cut_points = self.find_optimal_cut_points(adjusted_segments, audio)
-            
             processed_segments = []
-
+            
+            print(f"\nProcessing {total_segments} segments from {Path(input_path).name}...")
             
             # Process each segment
             for i, cut_point in enumerate(cut_points):
@@ -349,6 +536,24 @@ class AudioProcessor:
                 
                 # Extract segment
                 segment_audio = audio[start_ms:end_ms]
+                segment_duration = len(segment_audio) / 1000.0  # duration in seconds
+                segment_text = " ".join(w["word"] for w in adjusted_segments[i]["words"]).strip()
+                
+                # Check for abrupt ending if flag is set
+                if args.discard_abrupt:
+                    samples = np.array(segment_audio.get_array_of_samples(), dtype=np.float32)
+                    samples = samples / max(np.max(np.abs(samples)), 1)  # Normalize to [-1, 1]
+                    if self.check_for_abrupt_ending(samples, segment_audio.frame_rate):
+                        discarded_segments.append({
+                            "index": i,
+                            "duration": segment_duration,
+                            "text": segment_text,
+                            "reason": "abrupt ending"
+                        })
+                        print(f"\n⚠️  Discarding segment {i}:")
+                        print(f"   Duration: {segment_duration:.2f}s")
+                        print(f"   Text: \"{segment_text}\"")
+                        continue
                 
                 # Generate output filename
                 output_path = output_dir / f"{Path(input_path).stem}_segment_{i}.wav"
@@ -356,27 +561,53 @@ class AudioProcessor:
                 # Export raw segment
                 segment_audio.export(str(output_path), format="wav")
                 
-                # Apply audio processing if requested
-                if any([args.normalize is not None, args.dess, args.denoise, args.compress]):
+                # Apply audio processing chain
+                if any([args.normalize is not None, args.dess, args.denoise, 
+                       args.compress, args.fade_in > 0, args.fade_out > 0, args.trim]):
                     success = self.process_audio(
                         str(output_path),
-                        str(output_path),  # Process in place
+                        str(output_path),
                         normalize_target=-float(args.normalize) if args.normalize else None,
                         dess_profile='high' if args.dess else None,
                         denoise=args.denoise,
-                        compress_profile=args.compress if args.compress else None
+                        compress_profile=args.compress if args.compress else None,
+                        fade_in_ms=args.fade_in,
+                        fade_out_ms=args.fade_out,
+                        trim=args.trim
                     )
                     
                     if not success:
-                        print(f"Warning: Failed to process segment {i}")
+                        discarded_segments.append({
+                            "index": i,
+                            "duration": segment_duration,
+                            "text": segment_text,
+                            "reason": "processing failed"
+                        })
+                        print(f"\n⚠️  Discarding segment {i}:")
+                        print(f"   Duration: {segment_duration:.2f}s")
+                        print(f"   Text: \"{segment_text}\"")
+                        print(f"   Reason: Audio processing failed")
                         continue
                 
-                # Store segment information with trimmed start/end times
+                # Store segment information
                 processed_segments.append({
                     "audio_file": str(output_path),
-                    "text": " ".join(w["word"] for w in segments[i]["words"]).strip(),
+                    "text": segment_text,
                     "speaker_name": "001"
                 })
+            
+            # Print final statistics
+            print("\nSegment Processing Summary:")
+            print(f"Total segments: {total_segments}")
+            print(f"Successfully processed: {len(processed_segments)}")
+            if discarded_segments:
+                print(f"Discarded segments: {len(discarded_segments)}")
+                print("\nDiscarded segments details:")
+                for disc in discarded_segments:
+                    print(f"\nSegment {disc['index']}:")
+                    print(f"Duration: {disc['duration']:.2f}s")
+                    print(f"Text: \"{disc['text']}\"")
+                    print(f"Reason: {disc['reason']}")
             
             return processed_segments
             
@@ -393,8 +624,12 @@ class AudioProcessor:
                      normalize_target: Optional[float] = None,
                      dess_profile: Optional[str] = None,
                      denoise: bool = False,
-                     compress_profile: Optional[str] = None) -> bool:
+                     compress_profile: Optional[str] = None,
+                     fade_in_ms: Optional[int] = None,
+                     fade_out_ms: Optional[int] = None,
+                     trim: bool = False) -> bool:
         try:
+            # Load and pre-process audio
             if denoise:
                 # Use DeepFilterNet's own loading and processing functions
                 self._init_deepfilter()
@@ -409,30 +644,71 @@ class AudioProcessor:
             else:
                 # Load audio normally if no denoising needed
                 audio, sr = sf.read(input_path)
+                
+            # Validate audio array
+            if audio is None or len(audio) == 0:
+                print(f"Error: Empty or invalid audio loaded from {input_path}")
+                return False
+                
+            # Ensure audio is floating point with correct range
+            if audio.dtype != np.float32:
+                audio = audio.astype(np.float32)
+            if np.max(np.abs(audio)) > 1.0:
+                audio = audio / np.max(np.abs(audio))
 
             # Resample if needed
             if sr != self.target_sr:
+                print(f"Resampling from {sr}Hz to {self.target_sr}Hz")
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=self.target_sr)
+                sr = self.target_sr
             
-            # Normalize before compression
+            # Process order matters:
+            # 1. Normalize before compression (if requested)
             if normalize_target:
+                print(f"Normalizing to {normalize_target} LUFS")
                 audio = self._normalize(audio, target_lufs=normalize_target)
             
-            # Compress after normalization
+            # 2. Compress after normalization
             if compress_profile:
+                print(f"Applying {compress_profile} compression profile")
                 audio = self._compress(audio, compress_profile)
             
-            # De-ess last
+            # 3. De-ess after compression
             if dess_profile:
+                print(f"Applying {dess_profile} de-essing profile")
                 audio = self._deess(audio, dess_profile)
+            
+            # 4. Trim silence before fades
+            if trim:
+                print("Removing trailing silence")
+                audio = self.remove_trailing_silence(audio, sr)
+            
+            # 5. Apply fades after trimming
+            if fade_in_ms or fade_out_ms:
+                print(f"Applying fades: in={fade_in_ms}ms, out={fade_out_ms}ms")
+                audio = self.apply_fades(audio, sr, fade_in_ms, fade_out_ms)
             
             # Final peak normalization to prevent clipping
             peak = np.max(np.abs(audio))
             if peak > 0.99:
+                print("Applying final peak normalization")
                 audio = audio * (0.99 / peak)
             
+            # Validate final audio
+            if np.isnan(audio).any() or np.isinf(audio).any():
+                print("Error: Audio contains NaN or Inf values after processing")
+                return False
+                
             # Save processed audio
-            sf.write(output_path, audio, self.target_sr)
+            try:
+                sf.write(output_path, audio, sr)
+                if not os.path.exists(output_path):
+                    print(f"Error: File not written to {output_path}")
+                    return False
+            except Exception as e:
+                print(f"Error saving audio file: {str(e)}")
+                return False
+                
             return True
             
         except Exception as e:
@@ -441,6 +717,12 @@ class AudioProcessor:
             print(f"Audio type: {type(audio) if 'audio' in locals() else 'not loaded'}")
             print(f"Sample rate: {sr if 'sr' in locals() else 'not loaded'}")
             return False
+        finally:
+            # Clear any GPU memory if used
+            if denoise and hasattr(self, 'deepfilter_model'):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
     def _normalize(self, audio: np.ndarray, target_lufs: float = -16.0) -> np.ndarray:
         """Normalize audio to target LUFS with true peak limiting"""
         # Calculate current LUFS
@@ -683,8 +965,18 @@ def parse_arguments():
                        help="For mixed method, proportion of maximise-punctuation to punctuation-only (e.g., '6_4' for 60-40 split)")
     parser.add_argument("--training-proportion", default="8_2",
                        help="Proportion of training to validation data (e.g., '8_2' for 80-20 split)")
-    parser.add_argument("--negative-offset-last-word", type=int, default=100,
-                   help="Subtract this many milliseconds from the end time of the last word in each segment (default: 100)")
+    parser.add_argument("--negative-offset-last-word", type=int, default=50,
+                   help="Subtract this many milliseconds from the end time of the last word in each segment (default: 50)")
+    parser.add_argument("--breath", action="store_true",
+                   help="Apply breath removal preprocessing")
+    parser.add_argument("--trim", action="store_true",
+                   help="Automatically trim trailing silence from segments while preserving word endings")
+    parser.add_argument("--fade-in", type=int, metavar="MS", default=30,
+                       help="Apply fade-in effect for specified milliseconds from start (default: 30ms)")
+    parser.add_argument("--fade-out", type=int, metavar="MS", default=40,
+                       help="Apply fade-out effect for specified milliseconds from end (default: 40ms)")
+    parser.add_argument("--discard-abrupt", action="store_true",
+                   help="Detect and discard segments with abrupt endings")
     
     args = parser.parse_args()
     
@@ -842,47 +1134,97 @@ def process_audio(input_path, session_path, args):
         input_path = Path(input_path)
         files = [f for f in input_path.rglob('*') if f.suffix.lower() in ('.mp3', '.wav', '.flac', '.ogg')]
 
-    # First convert all files to WAV at target sample rate
-    for file in files:
-        output_file = audio_sources_dir / f"{file.stem}.wav"
-        convert_to_wav(file, output_file, args.sample_rate)
+    # Check if breath removal is available if --breath is passed
+    if args.breath:
+        try:
+            # Try to run breath-removal with --help or -h to check if it's available
+            result = subprocess.run(["breath-removal", "--help"], 
+                                 capture_output=True, 
+                                 text=True)
+            breath_removal_available = True
+            print("Breath removal tool found and available.")
+        except FileNotFoundError:
+            breath_removal_available = False
+            print("Warning: breath-removal command not found. Continuing without breath removal.")
+            args.breath = False  # Disable breath removal
+        except subprocess.CalledProcessError as e:
+            # Command exists but returned error - might be okay if --help isn't supported
+            breath_removal_available = True
+            print("Breath removal tool found.")
 
-    return audio_sources_dir
-
-def save_segment(audio: AudioSegment, 
-                start_ms: int, 
-                end_ms: int, 
-                output_path: Path,
-                args) -> bool:
-    """
-    Save an audio segment with optional processing.
-    """
-    try:
-        # Extract segment
-        segment_audio = audio[start_ms:end_ms]
+    # Create a temporary directory for breath removal if needed
+    breath_removal_dir = None
+    if args.breath and breath_removal_available:
+        breath_removal_dir = audio_sources_dir / "breath_removal_temp"
+        breath_removal_dir.mkdir(exist_ok=True)
+        print(f"Created temporary directory for breath removal: {breath_removal_dir}")
         
-        if len(segment_audio) > 0:
-            # First save the raw segment
-            segment_audio.export(str(output_path), format="wav")
-            
-            # Apply audio processing if requested
-            if any([args.normalize is not None, args.dess, args.denoise, args.compress]):
-                processor = AudioProcessor(target_sr=args.sample_rate)
-                success = processor.process_audio(
-                    str(output_path),
-                    str(output_path),  # Process in place
-                    normalize_target=-float(args.normalize) if args.normalize else None,
-                    dess_profile='high' if args.dess else None,
-                    denoise=args.denoise,
-                    compress_profile=args.compress if args.compress else None
-                )
-                return success
-            return True
-            
-    except Exception as e:
-        print(f"Error saving segment: {str(e)}")
-    return False
+    processed_files = []
+    
+    for file in files:
+        try:
+            if args.breath and breath_removal_available:
+                # Run breath removal
+                print(f"Processing {file.name} with breath removal...")
+                breath_output = breath_removal_dir / f"breath_removal_{file.name}"
+                
+                try:
+                    cmd = [
+                        "breath-removal",  # Changed from breath_removal to breath-removal
+                        "-i", str(file.absolute()),
+                        "-o", str(breath_removal_dir)
+                    ]
+                    print(f"Running command: {' '.join(cmd)}")
+                    
+                    result = subprocess.run(
+                        cmd,
+                        check=True,
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    # Check if the breath removal output exists
+                    if breath_output.exists():
+                        print(f"Breath removal successful for {file.name}")
+                        file_to_process = breath_output
+                    else:
+                        print(f"Warning: Breath removal output not found for {file.name}, using original file")
+                        file_to_process = file
+                except subprocess.CalledProcessError as e:
+                    print(f"Error during breath removal for {file.name}:")
+                    print(f"Command output: {e.stdout}")
+                    print(f"Command error: {e.stderr}")
+                    print("Using original file instead")
+                    file_to_process = file
+            else:
+                file_to_process = file
 
+            print(f"Converting {file_to_process.name} to WAV format...")
+            # Convert to WAV with target sample rate
+            output_file = audio_sources_dir / f"{file.stem}.wav"
+            convert_to_wav(file_to_process, output_file, args.sample_rate)
+            processed_files.append(output_file)
+            print(f"Successfully processed {file.name} -> {output_file.name}")
+            
+        except Exception as e:
+            print(f"Error processing {file.name}: {str(e)}")
+            print(f"Stack trace: {traceback.format_exc()}")
+            continue
+
+    # Clean up breath removal temporary directory if it was created
+    if breath_removal_dir and breath_removal_dir.exists():
+        try:
+            shutil.rmtree(breath_removal_dir)
+            print("Cleaned up breath removal temporary directory")
+        except Exception as e:
+            print(f"Warning: Could not remove temporary breath removal directory: {e}")
+
+    if not processed_files:
+        print("No files were successfully processed!")
+        return None
+
+    print(f"Successfully processed {len(processed_files)} files")
+    return audio_sources_dir
 
 def is_abbreviation(text, pos):
     """Check if punctuation is part of an abbreviation."""
