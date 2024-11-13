@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from pydub import AudioSegment
+from pydub.silence import detect_leading_silence
 import csv
 import torch
 import torchaudio
@@ -31,6 +32,7 @@ import numpy as np
 from df.enhance import enhance, init_df, load_audio, save_audio
 import soundfile as sf
 import librosa
+import traceback
 
 conda_path = Path("../conda/Scripts/conda.exe")
 
@@ -126,118 +128,98 @@ class AudioProcessor:
             print(f"Error applying fades: {str(e)}")
             return audio
 
-    def remove_trailing_silence(self, audio: np.ndarray, sr: int) -> np.ndarray:
+
+    def remove_trailing_silence(self, audio: np.ndarray, sr: int, silence_threshold=-50.0, chunk_size=10) -> np.ndarray:
         """
-        Remove trailing silence using a robust multi-stage approach.
+        Remove trailing silence using pydub's detect_leading_silence function.
         
         Args:
             audio: Input audio array
             sr: Sample rate
+            silence_threshold: The threshold (in dB) below which is considered silence
+            chunk_size: Size of chunks to analyze (in ms)
         Returns:
             Trimmed audio array with trailing silence removed
         """
         try:
-            # Ensure minimum audio length
-            if len(audio) < sr // 2:  # Less than 500ms
-                return audio
-                
-            # Stage 1: Calculate energy profile
-            window_size = sr // 50  # 20ms windows
-            energy_profile = []
-            
-            for i in range(0, len(audio), window_size):
-                window = audio[i:min(i + window_size, len(audio))]
-                rms = np.sqrt(np.mean(window**2))
-                energy_db = 20 * np.log10(max(rms, 1e-10))
-                energy_profile.append(energy_db)
-                
-            energy_profile = np.array(energy_profile)
-            
-            # Stage 2: Calculate adaptive threshold
-            non_silent = energy_profile[energy_profile > -60]
-            if len(non_silent) == 0:
-                return audio
-                
-            base_threshold = np.percentile(non_silent, 10) - 15
-            
-            # Stage 3: Find significant energy drops
-            diff_profile = np.diff(energy_profile)
-            window_count = len(energy_profile)
-            
-            # Look for the last significant sound
-            last_significant_idx = window_count - 1
-            min_silence_windows = sr // (window_size * 2)  # 500ms minimum
-            
-            for i in range(window_count - min_silence_windows - 1, 0, -1):
-                current_energy = energy_profile[i]
-                future_energy = energy_profile[i:i + min_silence_windows]
-                
-                # Check if we've found the last significant sound
-                if current_energy > base_threshold and np.all(future_energy < base_threshold):
-                    last_significant_idx = i
-                    break
-            
-            # Stage 4: Apply safety margin and fade out
-            end_sample = min(len(audio), (last_significant_idx + 1) * window_size + sr//10)  # Add 100ms safety
-            
-            # Apply fade out
-            fade_length = min(sr//50, len(audio) - end_sample)  # 20ms fade
-            if fade_length > 0:
-                fade = np.linspace(1, 0, fade_length)
-                audio[end_sample:end_sample + fade_length] *= fade
-                end_sample += fade_length
-            
-            return audio[:end_sample]
-            
+            # Convert numpy array to AudioSegment
+            audio_segment = AudioSegment(
+                audio.tobytes(), 
+                frame_rate=sr,
+                sample_width=audio.dtype.itemsize,
+                channels=1 if len(audio.shape) == 1 else audio.shape[1]
+            )
+
+            # Detect trailing silence by reversing the audio
+            trailing_silence = detect_leading_silence(
+                audio_segment.reverse(),
+                silence_threshold=silence_threshold,
+                chunk_size=chunk_size
+            )
+
+            # Convert milliseconds to samples
+            samples_to_remove = int((trailing_silence / 1000) * sr)
+
+            # Trim the audio
+            if samples_to_remove > 0:
+                return audio[:-samples_to_remove]
+            return audio
+
         except Exception as e:
             print(f"Error in remove_trailing_silence: {str(e)}")
             return audio
 
-    def find_lowest_energy_point(self, audio: AudioSegment, start_time: float, end_time: float) -> float:
+    def find_lowest_energy_point(self, audio: AudioSegment, start_time: float, end_time: float, is_start_cut: bool = True) -> float:
         """
-        Find the quietest point by dividing window into subwindows and selecting the middle
-        of the quietest eligible subwindow, with true silence detection.
+        Find the absolute quietest point using 2ms subwindows.
+        is_start_cut: True if looking for start cut (100ms max), False for end cut (200ms max)
         """
         try:
+            # Convert times to milliseconds
             start_ms = int(start_time * 1000)
             end_ms = int(end_time * 1000)
             
             if end_ms <= start_ms:
                 return start_time
                 
-            window = audio[start_ms:end_ms]
-            window_duration_ms = len(window)
+            # Apply maximum window constraints
+            window_duration_ms = end_ms - start_ms
+            max_window_ms = 100 if is_start_cut else 200
             
-            # Determine number of subwindows
-            min_subwindow_ms = 10
-            num_subwindows = 5 if window_duration_ms >= min_subwindow_ms * 5 else 4
-            subwindow_size_ms = window_duration_ms // num_subwindows
+            if window_duration_ms > max_window_ms:
+                if is_start_cut:
+                    start_ms = end_ms - max_window_ms
+                else:
+                    end_ms = start_ms + max_window_ms
+                window_duration_ms = max_window_ms
+                
+            window = audio[start_ms:end_ms]
+            
+            # Fixed 2ms subwindows
+            subwindow_size_ms = 2
+            num_subwindows = window_duration_ms // subwindow_size_ms
             
             print(f"\nAnalyzing {window_duration_ms}ms window from {start_time:.3f}s to {end_time:.3f}s")
             print(f"Dividing into {num_subwindows} subwindows of {subwindow_size_ms}ms each")
             
-            if subwindow_size_ms < 4:
-                print(f"Subwindows too small ({subwindow_size_ms}ms), using midpoint")
+            if subwindow_size_ms < 2 or num_subwindows < 1:
+                print(f"Window too small ({window_duration_ms}ms), using midpoint")
                 return (start_time + end_time) / 2
                 
             samples = np.array(window.get_array_of_samples(), dtype=np.float32)
+            sample_silence_threshold = 1e-4
             
             # Analyze each subwindow
-            subwindow_energies = []
-            subwindow_times = []
-            subwindow_silence = []
-            
-            # Define silence threshold for individual samples
-            sample_silence_threshold = 1e-4  # Adjust this based on your audio characteristics
+            subwindow_data = []
             
             for i in range(num_subwindows):
                 start_idx = i * len(samples) // num_subwindows
                 end_idx = (i + 1) * len(samples) // num_subwindows
                 subwindow = samples[start_idx:end_idx]
                 
-                # Check for true silence first
+                # Check for true silence
                 silence_ratio = np.sum(np.abs(subwindow) < sample_silence_threshold) / len(subwindow)
-                is_silent = silence_ratio > 0.95  # Consider silent if 95% of samples are below threshold
+                is_silent = silence_ratio > 0.95
                 
                 # Calculate RMS energy
                 rms = np.sqrt(np.mean(subwindow**2))
@@ -248,39 +230,38 @@ class AudioProcessor:
                 
                 print(f"Subwindow {i+1}: {db:.1f}dB, silence_ratio: {silence_ratio:.2f}, center at {subwindow_center:.3f}s")
                 
-                # Only consider middle subwindows
-                if 0 < i < num_subwindows - 1:
-                    subwindow_energies.append(db)
-                    subwindow_times.append(subwindow_center)
-                    subwindow_silence.append(is_silent)
+                subwindow_data.append({
+                    'index': i,
+                    'db': db,
+                    'center_time': subwindow_center,
+                    'is_silent': is_silent,
+                    'start_time': subwindow_start_time,
+                    'end_time': subwindow_start_time + (subwindow_size_ms / 1000),
+                    'samples': subwindow
+                })
             
-            if not subwindow_energies:
+            if not subwindow_data:
                 return (start_time + end_time) / 2
-                
+
             # First check for true silence
-            silent_indices = [i for i, is_silent in enumerate(subwindow_silence) if is_silent]
+            silent_windows = [w for w in subwindow_data if w['is_silent']]
             
-            if silent_indices:
-                # Among truly silent subwindows, choose the one closest to center
-                window_center = (start_time + end_time) / 2
-                center_distances = [abs(subwindow_times[i] - window_center) for i in silent_indices]
-                best_silent_idx = silent_indices[np.argmin(center_distances)]
-                optimal_time = subwindow_times[best_silent_idx]
+            if silent_windows:
+                # Find the silent window with lowest energy
+                optimal_window = min(silent_windows, key=lambda x: x['db'])
+                # Find the absolute lowest point within this window
+                min_sample_idx = np.argmin(np.abs(optimal_window['samples']))
+                relative_time = min_sample_idx / len(optimal_window['samples']) * subwindow_size_ms / 1000
+                optimal_time = optimal_window['start_time'] + relative_time
                 print(f"Found true silence at {optimal_time:.3f}s")
             else:
-                # If no true silence, check for quiet sections (below -55dB)
-                quiet_indices = [i for i, db in enumerate(subwindow_energies) if db < -55]
-                if quiet_indices:
-                    window_center = (start_time + end_time) / 2
-                    center_distances = [abs(subwindow_times[i] - window_center) for i in quiet_indices]
-                    best_quiet_idx = quiet_indices[np.argmin(center_distances)]
-                    optimal_time = subwindow_times[best_quiet_idx]
-                    print(f"Found quiet section ({subwindow_energies[best_quiet_idx]:.1f}dB) at {optimal_time:.3f}s")
-                else:
-                    # If no silence or quiet sections, use lowest energy
-                    lowest_energy_idx = np.argmin(subwindow_energies)
-                    optimal_time = subwindow_times[lowest_energy_idx]
-                    print(f"No silence found. Using lowest energy point ({subwindow_energies[lowest_energy_idx]:.1f}dB) at {optimal_time:.3f}s")
+                # Find the window with lowest energy
+                optimal_window = min(subwindow_data, key=lambda x: x['db'])
+                # Find the absolute lowest point within this window
+                min_sample_idx = np.argmin(np.abs(optimal_window['samples']))
+                relative_time = min_sample_idx / len(optimal_window['samples']) * subwindow_size_ms / 1000
+                optimal_time = optimal_window['start_time'] + relative_time
+                print(f"Found lowest energy point ({optimal_window['db']:.1f}dB) at {optimal_time:.3f}s")
             
             final_time = max(start_time, min(end_time, optimal_time))
             if final_time != optimal_time:
@@ -302,7 +283,10 @@ class AudioProcessor:
             
         cut_points = []
         audio_length_sec = len(audio) / 1000  # Convert to seconds
-        max_window = 0.5  # Maximum 400ms window for finding cut points
+        
+        # Define window sizes at the start of the method
+        max_start_window = 0.1  # 100ms for start cuts
+        max_end_window = 0.3    # 300ms for end cuts
         
         # Create debug log file in the same directory as the audio
         debug_log_path = Path(segments[0]['words'][0].get('audio_file', 'debug')).parent / 'cut_points_debug.log'
@@ -312,7 +296,8 @@ class AudioProcessor:
             debug_log.write("===========================\n")
             debug_log.write(f"Audio duration: {audio_length_sec:.3f}s\n")
             debug_log.write(f"Number of segments: {len(segments)}\n")
-            debug_log.write(f"Max search window: {max_window*1000:.0f}ms\n\n")
+            debug_log.write(f"Max start window: {max_start_window*1000:.0f}ms\n")
+            debug_log.write(f"Max end window: {max_end_window*1000:.0f}ms\n\n")
             
             for i in range(len(segments)):
                 curr_segment = segments[i]
@@ -345,12 +330,8 @@ class AudioProcessor:
                     if prev_last_word:
                         prev_word_end = prev_last_word["end"]
                         debug_log.write(f"\nPrevious context: '{prev_last_word['word']}' ending at {prev_word_end:.3f}s\n")
-                    else:
-                        prev_word_end = max(0, curr_first_word["start"] - max_window/2)
-                        debug_log.write(f"\nNo previous word found, using {prev_word_end:.3f}s\n")
                 else:
-                    prev_word_end = max(0, curr_first_word["start"] - max_window/2)
-                    debug_log.write(f"\nFirst segment - using {prev_word_end:.3f}s as start\n")
+                    debug_log.write(f"\nFirst segment - no previous word\n")
                 
                 # Get next segment info
                 if i < len(segments) - 1:
@@ -359,27 +340,34 @@ class AudioProcessor:
                     if next_first_word:
                         next_word_start = next_first_word["start"]
                         debug_log.write(f"Next context: '{next_first_word['word']}' starting at {next_word_start:.3f}s\n")
-                    else:
-                        next_word_start = min(audio_length_sec, curr_last_word["end"] + max_window/2)
-                        debug_log.write(f"No next word found, using {next_word_start:.3f}s\n")
                 else:
-                    next_word_start = min(audio_length_sec, curr_last_word["end"] + max_window/2)
-                    debug_log.write(f"Last segment - using {next_word_start:.3f}s as end\n")
+                    debug_log.write(f"Last segment - no next word\n")
                 
                 # Calculate search windows
                 start_search_end = curr_first_word["start"]
-                start_search_start = max(prev_word_end, start_search_end - max_window)
-                
+                if prev_word_end is not None and (start_search_end - prev_word_end) < max_start_window:
+                    # If previous word is closer than 100ms, look back to that word
+                    # But ensure at least 50ms window
+                    start_search_start = min(prev_word_end, start_search_end - 0.05)
+                else:
+                    # Otherwise only look back 100ms
+                    start_search_start = max(0, start_search_end - max_start_window)
+
                 end_search_start = curr_last_word["end"]
-                end_search_end = min(next_word_start, end_search_start + max_window)
+                if next_word_start is not None and (next_word_start - end_search_start) < max_end_window:
+                    # If next word is closer than 200ms, look forward to that word
+                    end_search_end = next_word_start
+                else:
+                    # Otherwise only look forward 200ms
+                    end_search_end = min(audio_length_sec, end_search_start + max_end_window)
                 
                 debug_log.write("\nSearching for cut points:\n")
                 debug_log.write(f"Start window: {start_search_start:.3f}s - {start_search_end:.3f}s ({(start_search_end-start_search_start)*1000:.0f}ms)\n")
                 debug_log.write(f"End window: {end_search_start:.3f}s - {end_search_end:.3f}s ({(end_search_end-end_search_start)*1000:.0f}ms)\n")
                 
                 # Find optimal points
-                start_time = self.find_lowest_energy_point(audio, start_search_start, start_search_end)
-                end_time = self.find_lowest_energy_point(audio, end_search_start, end_search_end)
+                start_time = self.find_lowest_energy_point(audio, start_search_start, start_search_end, is_start_cut=True)
+                end_time = self.find_lowest_energy_point(audio, end_search_start, end_search_end, is_start_cut=False)
                 
                 cut_points.append({
                     "start": start_time,
@@ -979,6 +967,16 @@ def parse_arguments():
                    help="Detect and discard segments with abrupt endings")
     
     args = parser.parse_args()
+
+    # Set default alignment models based on language if not specified by user
+    if not args.align_model:
+        language_align_models = {
+            "pl": "jonatasgrosman/wav2vec2-xls-r-1b-polish",
+            "nl": "FvH14/wav2vec2-XLSR-53-DutchCommonVoice12",
+            "de": "jonatasgrosman/wav2vec2-xls-r-1b-german",
+            "en": "jonatasgrosman/wav2vec2-xls-r-1b-english"
+        }
+        args.align_model = language_align_models.get(args.source_language)
     
     # Validate and convert proportions
     if args.method_proportion:
@@ -1000,7 +998,7 @@ def parse_arguments():
             raise ValueError("Training proportion must be in format 'N_M' where N+M=10 (e.g., '8_2')")
     
     if args.negative_offset_last_word is None:
-        args.negative_offset_last_word = 0 if args.source_language == "en" else 100
+        args.negative_offset_last_word = 0 if args.source_language == "en" else 50
     
     return args
 
@@ -1132,7 +1130,7 @@ def process_audio(input_path, session_path, args):
         files = [Path(input_path)]
     else:
         input_path = Path(input_path)
-        files = [f for f in input_path.rglob('*') if f.suffix.lower() in ('.mp3', '.wav', '.flac', '.ogg')]
+        files = [f for f in input_path.rglob('*') if f.suffix.lower() in ('.mp3', '.wav', '.flac', '.ogg', '.webm')]
 
     # Check if breath removal is available if --breath is passed
     if args.breath:
@@ -1265,8 +1263,7 @@ def find_real_sentence_end(text, pos):
     
     return i - 1
 
-def parse_transcription(json_file, audio_file, processed_dir, session_data, 
-                       sample_method, args):
+def parse_transcription(json_file, audio_file, processed_dir, session_data, sample_method, args):
     """Parse transcription and extract training segments with clean cuts."""
     with open(json_file, 'r', encoding='utf-8') as f:
         transcription = json.load(f)
@@ -1274,11 +1271,8 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data,
     processor = AudioProcessor(target_sr=args.sample_rate)
     qualifying_segments = session_data['qualifying_segments']
     
-    # Extract all words from all segments into a flat list
-    all_words = []
-    for segment in transcription['segments']:
-        if segment.get('words'):
-            all_words.extend(segment['words'])
+    # Extract words directly from word_segments
+    all_words = transcription.get('word_segments', [])
     
     # Initialize containers for segment information
     pending_segments = []
