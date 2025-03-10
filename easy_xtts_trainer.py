@@ -12,7 +12,8 @@ import torch
 import torchaudio
 from TTS.config.shared_configs import BaseDatasetConfig
 from TTS.tts.datasets import load_tts_samples
-from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig, XttsAudioConfig
+from TTS.tts.layers.xtts.trainer.gpt_trainer import GPTArgs, GPTTrainer, GPTTrainerConfig
+from TTS.tts.models.xtts import XttsAudioConfig
 from TTS.utils.manage import ModelManager
 from trainer import Trainer, TrainerArgs
 import gc
@@ -33,6 +34,9 @@ from df.enhance import enhance, init_df, load_audio, save_audio
 import soundfile as sf
 import librosa
 import traceback
+import ebooklib
+from ebooklib import epub
+from bs4 import BeautifulSoup
 
 conda_path = Path("../conda/Scripts/conda.exe")
 
@@ -184,7 +188,7 @@ class AudioProcessor:
                 
             # Apply maximum window constraints
             window_duration_ms = end_ms - start_ms
-            max_window_ms = 100 if is_start_cut else 200
+            max_window_ms = 100 if is_start_cut else 300
             
             if window_duration_ms > max_window_ms:
                 if is_start_cut:
@@ -285,8 +289,8 @@ class AudioProcessor:
         audio_length_sec = len(audio) / 1000  # Convert to seconds
         
         # Define window sizes at the start of the method
-        max_start_window = 0.1  # 100ms for start cuts
-        max_end_window = 0.3    # 300ms for end cuts
+        max_start_window = 0.15  # 100ms for start cuts
+        max_end_window = 0.4    # 300ms for end cuts
         
         # Create debug log file in the same directory as the audio
         debug_log_path = Path(segments[0]['words'][0].get('audio_file', 'debug')).parent / 'cut_points_debug.log'
@@ -511,11 +515,53 @@ class AudioProcessor:
                         )
                     adjusted_segment['words'].append(last_word)
                     adjusted_segments.append(adjusted_segment)
-            
-            cut_points = self.find_optimal_cut_points(adjusted_segments, audio)
+
+            # Check gaps between segments if min-gap is specified
+            valid_segments = []
+            if hasattr(args, 'min_gap') and args.min_gap:
+                min_gap_seconds = args.min_gap / 1000  # Convert to seconds
+                
+                for i, segment in enumerate(adjusted_segments):
+                    should_keep = True
+                    segment_duration = len(" ".join(w["word"] for w in segment['words']))  # Calculate duration
+                    
+                    # Check gap with previous segment
+                    if i > 0 and 'start' in segment['words'][0] and 'end' in adjusted_segments[i-1]['words'][-1]:
+                        prev_end = float(adjusted_segments[i-1]['words'][-1]['end'])
+                        curr_start = float(segment['words'][0]['start'])
+                        if curr_start - prev_end < min_gap_seconds:
+                            should_keep = False
+                            discarded_segments.append({
+                                "index": i,
+                                "duration": float(segment['words'][-1]['end']) - float(segment['words'][0]['start']),  # Calculate actual duration
+                                "text": segment['text'],
+                                "reason": f"gap with previous segment ({(curr_start - prev_end)*1000:.1f}ms) below minimum ({args.min_gap}ms)"
+                            })
+                            continue
+                    
+                    # Check gap with next segment
+                    if i < len(adjusted_segments)-1 and 'end' in segment['words'][-1] and 'start' in adjusted_segments[i+1]['words'][0]:
+                        curr_end = float(segment['words'][-1]['end'])
+                        next_start = float(adjusted_segments[i+1]['words'][0]['start'])
+                        if next_start - curr_end < min_gap_seconds:
+                            should_keep = False
+                            discarded_segments.append({
+                                "index": i,
+                                "duration": segment_duration,
+                                "text": segment['text'],
+                                "reason": f"gap with next segment ({(next_start - curr_end)*1000:.1f}ms) below minimum ({args.min_gap}ms)"
+                            })
+                            continue
+                    
+                    if should_keep:
+                        valid_segments.append(segment)
+            else:
+                valid_segments = adjusted_segments
+
+            cut_points = self.find_optimal_cut_points(valid_segments, audio)
             processed_segments = []
             
-            print(f"\nProcessing {total_segments} segments from {Path(input_path).name}...")
+            print(f"\nProcessing {len(valid_segments)} segments from {Path(input_path).name}...")
             
             # Process each segment
             for i, cut_point in enumerate(cut_points):
@@ -525,7 +571,7 @@ class AudioProcessor:
                 # Extract segment
                 segment_audio = audio[start_ms:end_ms]
                 segment_duration = len(segment_audio) / 1000.0  # duration in seconds
-                segment_text = " ".join(w["word"] for w in adjusted_segments[i]["words"]).strip()
+                segment_text = " ".join(w["word"] for w in valid_segments[i]["words"]).strip()
                 
                 # Check for abrupt ending if flag is set
                 if args.discard_abrupt:
@@ -918,8 +964,8 @@ def parse_arguments():
     parser.add_argument("--source-language", choices=["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh-cn", "ja", "ko", "hu"], required=True, help="Source language for XTTS")
     parser.add_argument("--whisper-model", choices=["medium", "medium.en", "large-v2", "large-v3"], default="large-v3", help="Whisper model to use for transcription")
     parser.add_argument("--enhance", action="store_true", help="Enable audio enhancement")
-    parser.add_argument("-i", "--input", required=True, help="Input folder or single file")
-    parser.add_argument("--session", help="Name for the session folder")
+    parser.add_argument("--input", help="Input folder or single file (required if not reusing session)")
+    parser.add_argument("--session", help="Name for the session folder or existing session to reuse")
     parser.add_argument("--separate", action="store_true", help="Enable speech separation")
     parser.add_argument("--epochs", type=int, default=6, help="Number of training epochs")
     parser.add_argument("--xtts-base-model", default="v2.0.2", help="XTTS base model version")
@@ -965,6 +1011,17 @@ def parse_arguments():
                        help="Apply fade-out effect for specified milliseconds from end (default: 40ms)")
     parser.add_argument("--discard-abrupt", action="store_true",
                    help="Detect and discard segments with abrupt endings")
+    parser.add_argument("--learning-rate", type=float, 
+                       default=5e-06, help="Learning rate for training (default: 5e-06)")
+    parser.add_argument("--scheduler", type=str, choices=['multistep', 'cosine'],
+                       help="Learning rate scheduler (if not specified, uses constant learning rate)")
+    parser.add_argument("--source-text", type=str, help="Source text file (.txt or .epub) for audiobook alignment")
+    parser.add_argument("--chapter-per-audio", type=int, default=1,
+                        help="Number of chapters to combine per audio file (default: 1)")
+    parser.add_argument("--prepare_dataset", action="store_true",
+                       help="Only prepare the dataset without starting training")
+    parser.add_argument("--min-gap", type=int, metavar="MS",
+                       help="Minimum gap in milliseconds required between segments")
     
     args = parser.parse_args()
 
@@ -972,9 +1029,13 @@ def parse_arguments():
     if not args.align_model:
         language_align_models = {
             "pl": "jonatasgrosman/wav2vec2-xls-r-1b-polish",
-            "nl": "FvH14/wav2vec2-XLSR-53-DutchCommonVoice12",
-            "de": "jonatasgrosman/wav2vec2-xls-r-1b-german",
-            "en": "jonatasgrosman/wav2vec2-xls-r-1b-english"
+            "nl": "GroNLP/wav2vec2-dutch-large-ft-cgn",
+            "de": "aware-ai/wav2vec2-xls-r-1b-german",
+            "en": "jonatasgrosman/wav2vec2-xls-r-1b-english",
+            "fr": "jonatasgrosman/wav2vec2-xls-r-1b-french",
+            "it": "jonatasgrosman/wav2vec2-xls-r-1b-italian",
+            "ru": "jonatasgrosman/wav2vec2-xls-r-1b-russian",
+            "es": "jonatasgrosman/wav2vec2-xls-r-1b-spanish"
         }
         args.align_model = language_align_models.get(args.source_language)
     
@@ -1009,85 +1070,250 @@ def create_session_folder(session_name):
     session_path.mkdir(parents=True, exist_ok=True)
     return session_path
 
+def convert_ctc_to_whisperx_format(ctc_data):
+    """Convert CTC forced aligner output format to WhisperX format while preserving original scores."""
+    whisperx_format = {
+        "word_segments": []
+    }
+    
+    # Convert each CTC segment to WhisperX word segment format
+    for segment in ctc_data["segments"]:
+        whisperx_format["word_segments"].append({
+            "word": segment["text"],
+            "start": segment["start"],
+            "end": segment["end"],
+            "score": segment["score"]
+        })
+    
+    # Add the full text
+    whisperx_format["text"] = " ".join(segment["text"] for segment in ctc_data["segments"])
+    
+    return whisperx_format
+
 def transcribe_audio(audio_file, args, session_path):
-    output_dir = (session_path / "transcriptions").resolve()
-    output_dir.mkdir(exist_ok=True)
-    
-    audio_file_absolute = audio_file.resolve()
-    
-    def get_conda_path():
-        if args.conda_path:
-            return os.path.join(args.conda_path, "conda.exe")
+    try:
+        print("\n=== Starting Audio Transcription ===")
+        print(f"Processing file: {audio_file}")
+        print(f"Language: {args.source_language}")
         
-        possible_paths = [
-            os.path.join(os.environ.get('USERPROFILE', ''), "anaconda3", "Scripts", "conda.exe"),
-            os.path.join(os.environ.get('USERPROFILE', ''), "miniconda3", "Scripts", "conda.exe"),
-            r"C:\ProgramData\Anaconda3\Scripts\conda.exe",
-            r"C:\ProgramData\Miniconda3\Scripts\conda.exe"
-        ]
+        output_dir = (session_path / "transcriptions").resolve()
+        output_dir.mkdir(exist_ok=True)
+        print(f"Output directory created/verified: {output_dir}")
+        
+        audio_file_absolute = audio_file.resolve()
+        print(f"Absolute audio path: {audio_file_absolute}")
+        
+        # If source text is provided, use CTC Forced Aligner
+        if hasattr(args, 'source_text') and args.source_text:
+            print("\n--- Using CTC Forced Aligner ---")
+            try:
+                # Use the source text path directly
+                source_text_path = Path(args.source_text).resolve()
+                if not source_text_path.exists():
+                    raise FileNotFoundError(f"Source text file not found: {source_text_path}")
+                # Handle epub files
+
+                if source_text_path.suffix.lower() == '.epub':
+                    print(f"Processing epub file: {source_text_path}")
+                    epub_processor = EpubProcessor()
+                    epub_processor.process_epub(source_text_path)
+
+                    # Get combined chapters based on audio file index
+                    try:
+                        # Extract index from filename, defaulting to 0 if no number found
+                        audio_numbers = ''.join(filter(str.isdigit, audio_file.stem))
+                        audio_index = (int(audio_numbers) - 1) if audio_numbers else 0
+                        chapters_per_audio = args.chapter_per_audio if hasattr(args, 'chapter_per_audio') else 1
+                        combined_chapters = epub_processor.get_combined_chapters(chapters_per_audio)
+                       
+                        if not combined_chapters:
+                            raise ValueError(f"No chapters were extracted from the epub file")
+
+                        # Handle index exceeding available chapters
+                        if audio_index >= len(combined_chapters):
+                            audio_index = len(combined_chapters) - 1
+                            print(f"Audio index adjusted to last available chapter group: {audio_index}")
+
+                        # Create temporary text file for this audio file
+                        temp_text_dir = session_path / "temp_chapters"
+                        temp_text_dir.mkdir(exist_ok=True)
+                        temp_text_path = temp_text_dir / f"{audio_file.stem}.txt"
+
+                        print(f"Creating temporary text file: {temp_text_path}")
+                        with open(temp_text_path, 'w', encoding='utf-8') as f:
+                            f.write(combined_chapters[audio_index])
+
+                        # Use this temporary file for alignment
+                        source_text_path = temp_text_path
+                        print(f"Using temporary text file for alignment: {source_text_path}")
+
+                    except Exception as e:
+                        print(f"Error processing epub chapters: {str(e)}")
+                        print("Traceback:")
+                        traceback.print_exc()
+                        raise
+                print(f"Using source text file: {source_text_path}")
+                with open(source_text_path, 'r', encoding='utf-8') as f:
+                    text_content = f.read()
+                print(f"Text content length: {len(text_content)} characters")
+                
+                # Map language codes
+                lang_map = {
+                    "en": "eng",
+                    "nl": "nld",
+                    # Add more mappings as needed
+                }
+                ctc_lang = lang_map.get(args.source_language, args.source_language)
+                print(f"Mapped language code: {args.source_language} -> {ctc_lang}")
+                
+                # Run CTC Forced Aligner
+                cmd = [
+                    "ctc-forced-aligner",
+                    "--audio_path", str(audio_file_absolute),
+                    "--text_path", str(source_text_path),
+                    "--language", ctc_lang,
+                    "--romanize"
+                ]
+
+                # Add alignment model if specified by user
+                if hasattr(args, 'align_model') and args.align_model:
+                    print(f"Using custom alignment model: {args.align_model}")
+                    cmd.extend(["--alignment_model", args.align_model])
+
+                print("\nExecuting CTC Forced Aligner command:")
+                print(f"Command: {' '.join(cmd)}")
+
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                print("\nCTC Aligner Output:")
+                print(f"stdout: {result.stdout}")
+                if result.stderr:
+                    print(f"stderr: {result.stderr}")
+                
+                # Find and read the JSON output
+                ctc_json = audio_file.parent / f"{audio_file.stem}.json"
+                print(f"\nLooking for CTC output at: {ctc_json}")
+                
+                if not ctc_json.exists():
+                    print(f"Warning: Expected JSON file not found at {ctc_json}")
+                    print("Checking directory contents:")
+                    print(list(audio_file.parent.glob("*.json")))
+                    raise FileNotFoundError(f"CTC alignment output not found: {ctc_json}")
+                
+                print(f"Found CTC output file: {ctc_json}")
+                print(f"File size: {ctc_json.stat().st_size} bytes")
+                
+                with open(ctc_json, 'r', encoding='utf-8') as f:
+                    ctc_data = json.load(f)
+                print("\nLoaded CTC JSON data:")
+                print(f"Number of segments: {len(ctc_data.get('segments', []))}")
+                
+                # Save original CTC output
+                original_ctc_path = output_dir / f"{audio_file.stem}_original_ctc.json"
+                with open(original_ctc_path, 'w', encoding='utf-8') as f:
+                    json.dump(ctc_data, f, indent=2)
+                print(f"\nSaved original CTC output to: {original_ctc_path}")
+                
+                # Convert to WhisperX format
+                print("\nConverting to WhisperX format...")
+                whisperx_data = convert_ctc_to_whisperx_format(ctc_data)
+                print(f"Converted {len(whisperx_data['word_segments'])} word segments")
+                
+                # Save in WhisperX format
+                json_file = output_dir / f"{audio_file.stem}.json"
+                with open(json_file, 'w', encoding='utf-8') as f:
+                    json.dump(whisperx_data, f, indent=2)
+                print(f"\nSaved WhisperX format JSON to: {json_file}")
+                print(f"File size: {json_file.stat().st_size} bytes")
+                
+                print("\n=== CTC Alignment Completed Successfully ===")
+                return json_file
+                
+            except Exception as e:
+                print("\n!!! CTC Alignment Failed !!!")
+                print(f"Error type: {type(e).__name__}")
+                print(f"Error message: {str(e)}")
+                print("Traceback:")
+                traceback.print_exc()
+                print("\nFalling back to WhisperX...")
+        
+        def get_conda_path():
+            if args.conda_path:
+                return os.path.join(args.conda_path, "conda.exe")
+            
+            possible_paths = [
+                os.path.join(os.environ.get('USERPROFILE', ''), "anaconda3", "Scripts", "conda.exe"),
+                os.path.join(os.environ.get('USERPROFILE', ''), "miniconda3", "Scripts", "conda.exe"),
+                r"C:\ProgramData\Anaconda3\Scripts\conda.exe",
+                r"C:\ProgramData\Miniconda3\Scripts\conda.exe"
+            ]
+            
+            if args.conda_env:
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        return path
+            
+            return str(conda_path)
+        
+        conda_executable = get_conda_path()
+        
+        def run_whisperx(env):
+            # Build base command without align_model
+            command = [
+                conda_executable,
+                "run",
+                "-n",
+                env,
+                "--no-capture-output",
+                "python",
+                "-m",
+                "whisperx",
+                str(audio_file_absolute),
+                "--language", args.source_language,
+                "--model", args.whisper_model,
+                "--output_dir", str(output_dir),
+                "--output_format", "json"
+            ]
+            
+            # Only add align_model if it was specified
+            if hasattr(args, 'align_model') and args.align_model:
+                command.extend(["--align_model", args.align_model])
+            
+            # Check if GPU is from Pascal generation
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0).lower()
+                pascal_gpus = ['1060', '1070', '1080', '1660', '1650']
+                if any(gpu in gpu_name for gpu in pascal_gpus):
+                    command.extend(["--compute_type", "int8"])
+            
+            try:
+                subprocess.run(command, check=True, capture_output=True, text=True)
+                return True
+            except subprocess.CalledProcessError as e:
+                print(f"Error running WhisperX with environment {env}: {e}")
+                print(f"Standard output: {e.stdout}")
+                print(f"Standard error: {e.stderr}")
+                return False
         
         if args.conda_env:
-            for path in possible_paths:
-                if os.path.exists(path):
-                    return path
+            if not run_whisperx(args.conda_env):
+                raise Exception(f"Failed to run WhisperX with provided environment: {args.conda_env}")
+        else:
+            # Try with hardcoded path and whisperx_installer
+            if not run_whisperx("whisperx_installer"):
+                # If it fails, try with "whisperx" and one of the usual Windows paths
+                conda_executable = next((path for path in possible_paths if os.path.exists(path)), None)
+                if conda_executable:
+                    if not run_whisperx("whisperx"):
+                        raise Exception("Failed to run WhisperX with both whisperx_installer and whisperx environments")
+                else:
+                    raise Exception("Could not find a valid conda path")
         
-        return str(conda_path)
-    
-    conda_executable = get_conda_path()
-    
-    def run_whisperx(env):
-        # Build base command without align_model
-        command = [
-            conda_executable,
-            "run",
-            "-n",
-            env,
-            "python",
-            "-m",
-            "whisperx",
-            str(audio_file_absolute),
-            "--language", args.source_language,
-            "--model", args.whisper_model,
-            "--output_dir", str(output_dir),
-            "--output_format", "json"
-        ]
+        json_file = output_dir / f"{audio_file.stem}.json"
+        return json_file
         
-        # Only add align_model if it was specified
-        if hasattr(args, 'align_model') and args.align_model:
-            command.extend(["--align_model", args.align_model])
-        
-        # Check if GPU is from Pascal generation
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0).lower()
-            pascal_gpus = ['1060', '1070', '1080', '1660', '1650']
-            if any(gpu in gpu_name for gpu in pascal_gpus):
-                command.extend(["--compute_type", "int8"])
-        
-        try:
-            subprocess.run(command, check=True, capture_output=True, text=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"Error running WhisperX with environment {env}: {e}")
-            print(f"Standard output: {e.stdout}")
-            print(f"Standard error: {e.stderr}")
-            return False
-    
-    if args.conda_env:
-        if not run_whisperx(args.conda_env):
-            raise Exception(f"Failed to run WhisperX with provided environment: {args.conda_env}")
-    else:
-        # Try with hardcoded path and whisperx_installer
-        if not run_whisperx("whisperx_installer"):
-            # If it fails, try with "whisperx" and one of the usual Windows paths
-            conda_executable = next((path for path in possible_paths if os.path.exists(path)), None)
-            if conda_executable:
-                if not run_whisperx("whisperx"):
-                    raise Exception("Failed to run WhisperX with both whisperx_installer and whisperx environments")
-            else:
-                raise Exception("Could not find a valid conda path")
-    
-    json_file = output_dir / f"{audio_file.stem}.json"
-    return json_file
+    except Exception as e:
+        print(f"Error in transcribe_audio: {str(e)}")
+        raise
 
 def create_log_file(session_path):
     log_file = session_path / f"session-log--{datetime.now().strftime('%Y-%m-%d--%H-%M')}.txt"
@@ -1299,10 +1525,19 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data, samp
         
     def calculate_segment_duration(words):
         """Calculate duration between first and last word with valid timestamps."""
-        valid_words = [w for w in words if is_valid_timestamps(w)]
-        if not valid_words:
+        first_timestamp = None
+        last_timestamp = None
+        
+        for word in words:
+            if is_valid_timestamps(word):
+                if first_timestamp is None:
+                    first_timestamp = float(word['start'])
+                last_timestamp = float(word['end'])
+        
+        if first_timestamp is None or last_timestamp is None:
             return 0
-        return float(valid_words[-1]['end']) - float(valid_words[0]['start'])
+            
+        return last_timestamp - first_timestamp
 
     def process_maximise_punctuation(current_segment=None):
         if current_segment is None:
@@ -1320,53 +1555,14 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data, samp
             while i < len(words_to_process):
                 word = words_to_process[i]
                 
-                # Check if current word has valid timestamps
+                # Always add words without timestamps to current segment
                 if not is_valid_timestamps(word):
-                    # If word has punctuation, we need to handle backtracking
-                    if any(p in word['word'] for p in '.!?;,-'):
-                        if current_segment["words"]:
-                            # Try to build new segment from current segment's start up to last valid break
-                            last_valid_break = None
-                            current_duration = 0
-                            
-                            for idx, w in enumerate(current_segment["words"]):
-                                if is_valid_timestamps(w):
-                                    if any(p in w['word'] for p in '.!?;,-'):
-                                        if not is_abbreviation(w['word'], len(w['word'])-1):
-                                            temp_duration = calculate_segment_duration(current_segment["words"][:idx + 1])
-                                            if temp_duration <= args.max_audio_time:
-                                                last_valid_break = idx
-                                                current_duration = temp_duration
-                            
-                            if last_valid_break is not None:
-                                # Add segment to pending instead of saving immediately
-                                valid_segment = current_segment["words"][:last_valid_break + 1]
-                                pending_segments.append({
-                                    "words": valid_segment,
-                                    "text": " ".join(w['word'] for w in valid_segment)
-                                })
-                                segments_processed += 1
-                        
-                        # Whether we saved a segment or not, find next valid starting point
-                        next_valid_idx = None
-                        for j in range(i + 1, len(words_to_process)):
-                            if (is_valid_timestamps(words_to_process[j]) and 
-                                any(p in words_to_process[j]['word'] for p in '.!?;,-')):
-                                next_valid_idx = j
-                                break
-                        
-                        if next_valid_idx:
-                            i = next_valid_idx + 1
-                            current_segment["words"] = []
-                            current_segment["text"] = ""
-                            current_segment["break_points"] = []
-                            continue
-                        else:
-                            break
-                    
-                    # Skip words without timestamps
+                    if current_segment["words"]:
+                        current_segment["words"].append(word)
+                        current_segment["text"] += " " + word['word']
                     i += 1
                     continue
+
                 # Before adding word, check if current segment already exceeds limits
                 if current_segment["words"]:
                     current_duration = calculate_segment_duration(current_segment["words"])
@@ -1395,8 +1591,8 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data, samp
                 duration = calculate_segment_duration(current_segment["words"])
                 text_length = len(current_segment["text"])
                 
-                # Check if this word creates a potential break point
-                if any(p in word['word'] for p in '.!?;,-'):
+                # Only consider words with timestamps as break points
+                if is_valid_timestamps(word) and any(p in word['word'] for p in '.!?;,-'):
                     if not is_abbreviation(word['word'], len(word['word'])-1):
                         if duration <= args.max_audio_time and text_length <= args.max_text_length:
                             current_segment["break_points"].append({
@@ -1451,34 +1647,10 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data, samp
             while i < len(words_to_process):  
                 word = words_to_process[i]
                 
+                # Always add words without timestamps to current segment
                 if not is_valid_timestamps(word):
-                    if any(p in word['word'] for p in '.!?;,-'):
-                        # Try to extend to next punctuation mark
-                        next_break_idx = find_next_valid_break(all_words, i + 1)
-                        if next_break_idx:
-                            # Check if extended segment would be within limits
-                            potential_segment = current_words + all_words[i:next_break_idx + 1]
-                            duration = calculate_segment_duration(potential_segment)
-                            text_length = len(" ".join(w['word'] for w in potential_segment))
-                            
-                            if duration <= args.max_audio_time and text_length <= args.max_text_length:
-                                if duration >= 2.0:  # Minimum duration check
-                                    pending_segments.append({
-                                        "words": potential_segment,
-                                        "text": " ".join(w['word'] for w in potential_segment)
-                                    })
-                                    segments_processed += 1
-                                    current_words = []
-                                    i = next_break_idx + 1
-                                    continue
-                        
-                        # If extension failed, start fresh from next valid break
-                        next_start = find_next_valid_break(all_words, i + 1)
-                        if next_start:
-                            i = next_start
-                            current_words = []
-                        else:
-                            break
+                    if current_words:
+                        current_words.append(word)
                     i += 1
                     continue
                 
@@ -1492,7 +1664,7 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data, samp
                         current_words = [word]
                         continue
                     
-                    if duration >= 2.0 and any(p in word['word'] for p in '.!?;,-'):
+                    if duration >= 2.0 and is_valid_timestamps(word) and any(p in word['word'] for p in '.!?;,-'):
                         if not is_abbreviation(word['word'], len(word['word'])-1):
                             pending_segments.append({
                                 "words": current_words,
@@ -1576,9 +1748,9 @@ def parse_transcription(json_file, audio_file, processed_dir, session_data, samp
         # Add processed segments to session data
         qualifying_segments.extend(processed_segments)
     
-    return segments_count       
+    return segments_count      
 
-def create_metadata_files(session_data, session_path, training_proportion=0.8):  # Add parameter with default
+def create_metadata_files(session_data, session_path, training_proportion=0.8):
     databases_dir = session_path / "databases"
     databases_dir.mkdir(exist_ok=True)
 
@@ -1668,9 +1840,19 @@ def download_models(base_path, xtts_base_model):
         else:
             print(f"Error: {filename} does not exist after download attempt!")
 
+def get_dataset_size(train_csv: str) -> int:
+    """Get number of samples from training CSV file."""
+    try:
+        with open(train_csv, 'r', encoding='utf-8') as f:
+            # Subtract 1 for header row
+            return sum(1 for line in f) - 1
+    except Exception as e:
+        print(f"Error reading CSV file: {e}")
+        return 0
+
 def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acumm, 
               train_csv, eval_csv, output_path, sample_rate, model_name, max_audio_time,
-              max_text_length):
+              max_text_length, learning_rate=5e-06, scheduler=None):
     """
     Train the GPT model.
     """
@@ -1680,16 +1862,6 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
     OUT_PATH = os.path.join(output_path, "run", "training")
     CHECKPOINTS_OUT_PATH = os.path.join(Path.cwd(), "base_models", f"{version}")
     os.makedirs(CHECKPOINTS_OUT_PATH, exist_ok=True)
-
-    # # Initialize metrics tracking
-    # metrics = TrainingMetrics(
-        # model_name=model_name,
-        # start_time=time.time(),
-        # num_epochs=num_epochs,
-        # gradient_accumulation=grad_acumm,
-        # language=language,
-        # sample_rate=sample_rate
-    # )
 
     config_dataset = BaseDatasetConfig(
         formatter="coqui",
@@ -1717,10 +1889,10 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
     max_conditioning_length = max_wav_length  # Same as max_wav_length for XTTS
 
     model_args = GPTArgs(
-        max_conditioning_length=max_conditioning_length,
+        max_conditioning_length=132300,
         min_conditioning_length=6615,
         max_wav_length=max_wav_length,
-        max_text_length=max_text_length,  # Use the parameter directly
+        max_text_length=max_text_length,
         mel_norm_file=MEL_NORM_FILE,
         dvae_checkpoint=DVAE_CHECKPOINT,
         xtts_checkpoint=XTTS_CHECKPOINT,
@@ -1739,6 +1911,74 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
         output_sample_rate=24000
     )
 
+    # Calculate steps based on actual dataset
+    samples_per_epoch = get_dataset_size(train_csv)
+    steps_per_epoch = samples_per_epoch // (batch_size * grad_acumm)
+    total_steps = steps_per_epoch * num_epochs
+
+    print(f"\nTraining schedule configuration:")
+    print(f"Samples per epoch: {samples_per_epoch}")
+    print(f"Steps per epoch: {steps_per_epoch}")
+    print(f"Total steps: {total_steps}")
+    print(f"Batch size: {batch_size}")
+    print(f"Gradient accumulation: {grad_acumm}")
+    print(f"Effective batch size: {batch_size * grad_acumm}")
+    print(f"Initial learning rate: {learning_rate}")
+
+    # Configure scheduler based on type and training parameters
+    if scheduler == 'multistep':
+        # Calculate optimal milestone steps based on training setup
+        if num_epochs <= 10:
+            milestone_percents = [0.7, 0.9]
+            milestones = [int(total_steps * p) for p in milestone_percents]
+        else:
+            milestone_percents = [0.25, 0.6, 0.8]
+            milestones = [int(total_steps * p) for p in milestone_percents]
+
+        scheduler_config = {
+            'scheduler': "MultiStepLR",
+            'params': {
+                "milestones": milestones,
+                "gamma": 0.5,
+                "last_epoch": -1
+            }
+        }
+        print(f"\nMultiStep LR Schedule:")
+        print(f"Milestones at steps: {milestones}")
+        print(f"Learning rates: {learning_rate} -> {learning_rate*0.5} -> {learning_rate*0.25}")
+
+    elif scheduler == 'cosine':
+        # Calculate optimal cycle length based on training setup
+        if num_epochs <= 10:
+            # For short training, one full cycle
+            t0 = total_steps
+            t_mult = 1
+        else:
+            # For longer training, multiple cycles
+            t0 = steps_per_epoch * 3  # Initial cycle of 3 epochs
+            t_mult = 2
+
+        eta_min = learning_rate * 0.1  # Minimum LR is 10% of initial LR
+        
+        scheduler_config = {
+            'scheduler': "CosineAnnealingWarmRestarts",
+            'params': {
+                "T_0": t0,
+                "T_mult": t_mult,
+                "eta_min": eta_min
+            }
+        }
+        print(f"\nCosine Annealing Schedule:")
+        print(f"Initial cycle length (T_0): {t0} steps ({t0/steps_per_epoch:.1f} epochs)")
+        print(f"Cycle multiplier (T_mult): {t_mult}")
+        print(f"Learning rate range: {learning_rate} -> {eta_min}")
+
+    else:
+        # No scheduler - constant learning rate
+        scheduler_config = None
+        print("\nConstant learning rate schedule")
+        print(f"Learning rate: {learning_rate}")
+
     config = GPTTrainerConfig(
         epochs=num_epochs,
         output_path=OUT_PATH,
@@ -1748,6 +1988,7 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
         run_description="GPT XTTS training",
         dashboard_logger=DASHBOARD_LOGGER,
         audio=audio_config,
+        batch_group_size=48,
         batch_size=batch_size,
         eval_batch_size=batch_size,
         num_loader_workers=8 if language != "ja" else 0,
@@ -1755,20 +1996,25 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
         save_step=1000,
         save_n_checkpoints=1,
         save_checkpoints=True,
+        optimizer_wd_only_on_weights=True,
         optimizer="AdamW",
         optimizer_params={
             "betas": [0.9, 0.96],
             "eps": 1e-8,
             "weight_decay": 1e-2
         },
-        lr=5e-06,
-        lr_scheduler="MultiStepLR",
-        lr_scheduler_params={
-            "milestones": [50000 * 18, 150000 * 18, 300000 * 18],
-            "gamma": 0.5,
-            "last_epoch": -1
-        },
+        lr=learning_rate,
+        scheduler_after_epoch=False,  # Always use step-based scheduling
+        lr_scheduler=scheduler_config['scheduler'] if scheduler_config else None,
+        lr_scheduler_params=scheduler_config['params'] if scheduler_config else None,
     )
+
+    print("\nScheduler configuration:")
+    if scheduler_config:
+        print(f"Type: {scheduler_config['scheduler']}")
+        print(f"Parameters: {scheduler_config['params']}")
+    else:
+        print("None (constant learning rate)")
 
     model = GPTTrainer.init_from_config(config)
     train_samples, eval_samples = load_tts_samples(
@@ -1777,9 +2023,6 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
         eval_split_max_size=config.eval_split_max_size,
         eval_split_size=config.eval_split_size,
     )
-
-    # Update metrics with audio stats before training
-    #metrics.calculate_audio_stats(train_samples)
 
     trainer = Trainer(
         TrainerArgs(
@@ -1795,17 +2038,6 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
     
     # Train the model
     trainer.fit()
-
-    # # Update metrics after training
-    # metrics.end_time = time.time()
-    
-    # # Parse training logs
-    # log_file = Path(OUT_PATH) / "log.txt"
-    # if log_file.exists():
-        # metrics.update_from_log(log_file)
-    
-    # # Save metrics
-    # metrics.save(Path(output_path))
 
     del model, trainer, train_samples, eval_samples
     gc.collect()
@@ -1915,110 +2147,541 @@ def copy_reference_samples(processed_dir, session_path, session_data):
     print(f"Long sample: {random_long['path'].name}")
     print(f"Fastest sample: {fastest['path'].name} (speech rate: {fastest['speech_rate']:.2f} chars/sec)")
 
-def main():
+def is_session_reusable(session_path: Path) -> Tuple[bool, str]:
+    """
+    Check if a session folder contains all necessary files for reuse.
+    
+    Returns:
+        Tuple[bool, str]: (is_reusable, message)
+    """
     try:
-        args = parse_arguments()
-        session_path = create_session_folder(args.session)
-        log_file = create_log_file(session_path)
-        json_file = create_json_file(session_path)
-
-        session_data = {'qualifying_segments': []}
-
-        with open(json_file, 'w') as f:
-            json.dump(session_data, f)
-
-        # Process audio - this function now handles all audio preprocessing including
-        # normalization, de-essing, denoising, and compression
-        audio_sources_dir = process_audio(args.input, session_path, args)
-
-        total_segments = 0
-        for audio_file in audio_sources_dir.glob('*.wav'):
-            json_file = transcribe_audio(audio_file, args, session_path)
-            segments_count = parse_transcription(
-                json_file, 
-                audio_file, 
-                audio_sources_dir / "processed", 
-                session_data, 
-                args.sample_method,
-                args
-            )
-            total_segments += segments_count
-            print(f"Total qualifying segments after processing {audio_file.name}: {segments_count}")
-
-            # Save updated session_data to JSON file after each audio file
-            with open(json_file, 'w') as f:
-                json.dump(session_data, f)
-
-        print(f"Total qualifying segments across all files: {total_segments}")
-
-        train_csv, eval_csv = create_metadata_files(
-            session_data, 
-            session_path,
-            args.training_proportion if hasattr(args, 'training_proportion') else 0.8  # Use new proportion if provided
-        )
-
-        if train_csv is None or eval_csv is None:
-            print("Failed to create metadata files. Exiting.")
-            return
-
-        # Clear GPU memory before training
-        print("\nClearing GPU memory before training...")
-        if torch.cuda.is_available():
-            # Clear CUDA cache
-            torch.cuda.empty_cache()
-            # Reset peak memory stats
-            torch.cuda.reset_peak_memory_stats()
-            # Force garbage collection
-            gc.collect()
-            # Clear cache again
-            torch.cuda.empty_cache()
+        # Check if session folder exists
+        if not session_path.exists():
+            return False, "Session folder does not exist"
             
-            # Print memory stats
-            print("GPU Memory Status after clearing:")
-            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-            print(f"Cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB\n")
+        # Check for databases
+        database_dir = session_path / "databases"
+        train_csv = database_dir / "train_metadata.csv"
+        eval_csv = database_dir / "eval_metadata.csv"
+        
+        if not all([database_dir.exists(), train_csv.exists(), eval_csv.exists()]):
+            return False, "Missing database files"
+            
+        # Check for processed audio
+        processed_dir = session_path / "audio_sources" / "processed"
+        if not processed_dir.exists():
+            return False, "Missing processed audio directory"
+            
+        # Check if there are wav files in processed directory
+        wav_files = list(processed_dir.glob("*.wav"))
+        if not wav_files:
+            return False, "No processed audio files found"
+            
+        # Verify CSV files contain valid entries
+        try:
+            with open(train_csv, 'r', encoding='utf-8') as f:
+                train_data = f.readlines()
+            with open(eval_csv, 'r', encoding='utf-8') as f:
+                eval_data = f.readlines()
+                
+            if len(train_data) < 2 or len(eval_data) < 2:  # Including header
+                return False, "Empty metadata files"
+                
+        except Exception as e:
+            return False, f"Error reading metadata files: {str(e)}"
+            
+        return True, "Session is reusable"
+        
+    except Exception as e:
+        return False, f"Error checking session: {str(e)}"
 
-        models_dir = session_path / "models"
-        models_dir.mkdir(exist_ok=True)
+def create_new_session_name(original_session: Path, epochs: int, grads: int) -> Path:
+    """
+    Create a new session name with timestamp and training parameters.
+    """
+    timestamp = datetime.now().strftime('%y_%m_%d__%H_%M')
+    new_name = f"{original_session.name}__{timestamp}__e{epochs}__g{grads}"
+    return Path(new_name)
 
-        model_name = args.xtts_model_name or f"xtts_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        model_output_path = models_dir / model_name
+def update_csv_paths(csv_file: Path, old_session: Path, new_session: Path):
+    """Update audio file paths in CSV to point to the new session location"""
+    try:
+        # Read existing content
+        with open(csv_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        # Update paths in content
+        new_lines = []
+        header = True
+        
+        for line in lines:
+            if header:
+                new_lines.append(line)
+                header = False
+                continue
+                
+            if line.strip() and '|' in line:
+                parts = line.split('|')
+                if len(parts) >= 3:
+                    try:
+                        # Convert paths to absolute paths
+                        old_path = Path(parts[0]).resolve()
+                        old_session_abs = old_session.resolve()
+                        new_session_abs = new_session.resolve()
+                        
+                        # Check if the path contains the old session path
+                        if str(old_session_abs) in str(old_path):
+                            # Get the relative part of the path
+                            rel_path = old_path.relative_to(old_session_abs)
+                            # Create new path
+                            new_path = new_session_abs / rel_path
+                        else:
+                            # If the path doesn't contain the old session path,
+                            # assume it's in the processed directory
+                            new_path = new_session_abs / "audio_sources" / "processed" / old_path.name
+                            
+                        new_lines.append(f"{new_path}|{parts[1]}|{parts[2]}")
+                    except Exception as e:
+                        print(f"Warning: Could not process path in line: {line.strip()}")
+                        print(f"Error details: {str(e)}")
+                        new_lines.append(line)
+            else:
+                new_lines.append(line)
+                
+        # Write updated content
+        with open(csv_file, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+            
+        print(f"Updated paths in {csv_file.name}")
+        return True
+        
+    except Exception as e:
+        print(f"Error updating paths in {csv_file}: {str(e)}")
+        return False
 
-        base_model_path = os.path.join(Path.cwd(), "base_models", args.xtts_base_model)
-        download_models(base_model_path, args.xtts_base_model)
+def verify_copied_files(src_session: Path, dst_session: Path) -> bool:
+    """Verify that all necessary files were copied correctly"""
+    try:
+        # Check database files
+        src_train = src_session / "databases" / "train_metadata.csv"
+        src_eval = src_session / "databases" / "eval_metadata.csv"
+        dst_train = dst_session / "databases" / "train_metadata.csv"
+        dst_eval = dst_session / "databases" / "eval_metadata.csv"
+        
+        if not all(f.exists() for f in [dst_train, dst_eval]):
+            return False
+            
+        # Check audio files
+        src_audio_files = set(f.name for f in (src_session / "audio_sources" / "processed").glob("*.wav"))
+        dst_audio_files = set(f.name for f in (dst_session / "audio_sources" / "processed").glob("*.wav"))
+        
+        if src_audio_files != dst_audio_files:
+            print(f"Audio files mismatch. Source has {len(src_audio_files)} files, destination has {len(dst_audio_files)}")
+            return False
+            
+        # Verify file sizes match
+        for fname in src_audio_files:
+            src_size = (src_session / "audio_sources" / "processed" / fname).stat().st_size
+            dst_size = (dst_session / "audio_sources" / "processed" / fname).stat().st_size
+            if src_size != dst_size:
+                print(f"Size mismatch for {fname}")
+                return False
+                
+        return True
+        
+    except Exception as e:
+        print(f"Error verifying copied files: {str(e)}")
+        return False
 
-        speaker_file, config_file, checkpoint_file, tokenizer_file, training_output_path = train_gpt(
-            custom_model="",
-            version=args.xtts_base_model,
-            language=args.source_language,
-            num_epochs=args.epochs,
-            batch_size=args.batch,
-            grad_acumm=args.gradient,
-            train_csv=str(train_csv),
-            eval_csv=str(eval_csv),
-            output_path=str(model_output_path),
-            sample_rate=args.sample_rate,
-            model_name=model_name,
-            max_audio_time=args.max_audio_time,
-            max_text_length=args.max_text_length
-        )
+def copy_session_files(src_session: Path, dst_session: Path) -> bool:
+    """Copy session files and update paths"""
+    try:
+        print("\nCopying session files...")
+        
+        # Resolve paths
+        src_session = src_session.resolve()
+        dst_session = dst_session.resolve()
+        print(f"Source session: {src_session}")
+        print(f"Destination session: {dst_session}")
+        
+        # Create destination directories
+        dst_session.mkdir(parents=True, exist_ok=True)
+        (dst_session / "databases").mkdir(exist_ok=True)
+        (dst_session / "audio_sources" / "processed").mkdir(parents=True, exist_ok=True)
+        
+        # Copy database files
+        print("Copying database files...")
+        for csv_file in ["train_metadata.csv", "eval_metadata.csv"]:
+            src = src_session / "databases" / csv_file
+            dst = dst_session / "databases" / csv_file
+            print(f"Copying {src} to {dst}")
+            shutil.copy2(src, dst)
+            
+            # Update paths in the copied CSV
+            print(f"Updating paths in {csv_file}...")
+            if not update_csv_paths(dst, src_session, dst_session):
+                raise RuntimeError(f"Failed to update paths in {csv_file}")
+        
+        # Copy processed audio files
+        print("Copying audio files...")
+        src_processed = src_session / "audio_sources" / "processed"
+        audio_files = list(src_processed.glob("*.wav"))
+        total_files = len(audio_files)
+        print(f"Found {total_files} audio files to copy")
+        
+        for i, wav_file in enumerate(audio_files, 1):
+            dst_file = dst_session / "audio_sources" / "processed" / wav_file.name
+            print(f"Copying {i}/{total_files}: {wav_file.name}")
+            shutil.copy2(wav_file, dst_file)
+            
+        # Verify the copy operation
+        print("\nVerifying copied files...")
+        if not verify_copied_files(src_session, dst_session):
+            raise RuntimeError("File verification failed")
+            
+        print("Session files copied and verified successfully")
+        return True
+        
+    except Exception as e:
+        print(f"Error copying session files: {str(e)}")
+        return False
 
-        optimization_message, optimized_model_path = optimize_model(model_output_path, base_model_path)
-
-        print(f"Training completed. Model saved at: {model_output_path}")
-        print(optimization_message)
-        print(f"Optimized model path: {optimized_model_path}")
-
-        if optimized_model_path:  
-            copy_reference_samples(audio_sources_dir / "processed", session_path, session_data)
-            print("Reference samples copied successfully.")
+class EpubProcessor:
+    def __init__(self):
+        self.chapters = []
+    
+    def extract_chapter_text(self, html_content):
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Remove captions and footnotes
+        for element in soup.find_all(class_=lambda x: x and ('caption' in x.lower() or 'footnote' in x.lower())):
+            element.decompress()
+        
+        # Extract clean text
+        text = []
+        for p in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+            if not any(c in p.get('class', []) for c in ['caption', 'footnote']):
+                text.append(p.get_text().strip())
+        
+        return '\n\n'.join(filter(None, text))  # Filter out empty strings
+    
+    def process_epub(self, epub_path):
+        print("Processing EPUB file...")
+        book = epub.read_epub(epub_path)
+        current_chapter = []
+        chapter_count = 0
+        
+        for item in book.get_items():
+            if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                filename = item.get_name()
+                if "cover" not in filename.lower() and "toc" not in filename.lower():
+                    print(f"Processing document: {filename}")
+                    content = item.get_content().decode('utf-8')
+                    soup = BeautifulSoup(content, 'html.parser')
+                    
+                    # Find h2 tags or divs that might be chapters
+                    chapter_markers = soup.find_all(['h2', 'div'], class_=lambda x: x and 'chapter' in x.lower())
+                    if not chapter_markers:
+                        chapter_markers = soup.find_all('h2')
+                    
+                    if chapter_markers:
+                        print(f"Found {len(chapter_markers)} potential chapter markers")
+                        for i, marker in enumerate(chapter_markers):
+                            chapter_text = []
+                            current = marker
+                            
+                            # Get text until next chapter marker or end
+                            while current:
+                                next_sibling = current.find_next_sibling()
+                                if (next_sibling and 
+                                    (next_sibling.name == 'h2' or 
+                                     (next_sibling.get('class') and 'chapter' in ' '.join(next_sibling.get('class')).lower()))):
+                                    break
+                                
+                                if current.name not in ['h2']:
+                                    text = current.get_text().strip()
+                                    if text:
+                                        chapter_text.append(text)
+                                current = next_sibling
+                            
+                            if chapter_text:
+                                chapter_count += 1
+                                print(f"Extracted chapter {chapter_count} with {len(chapter_text)} paragraphs")
+                                self.chapters.append('\n\n'.join(chapter_text))
+                    else:
+                        # If no chapter markers, treat whole content as one chapter
+                        text = self.extract_chapter_text(content)
+                        if text.strip():
+                            chapter_count += 1
+                            print(f"Extracted chapter {chapter_count} from {filename}")
+                            self.chapters.append(text)
+        
+        print(f"Total chapters extracted: {len(self.chapters)}")
+        
+        # Remove first two and last chapter if we have enough chapters
+        if len(self.chapters) > 3:
+            print(f"Removing first two and last chapter. Remaining chapters: {len(self.chapters)-3}")
+            self.chapters = self.chapters[2:-1]
         else:
-            print("Warning: Optimized model path not found. Reference samples not copied.")
+            print(f"Not enough chapters to remove first two and last. Keeping all {len(self.chapters)} chapters")
+    
+    def get_combined_chapters(self, num_chapters):
+        """Combine specified number of chapters together."""
+        if not self.chapters:
+            print("Warning: No chapters available")
+            return []
+        
+        print(f"Combining chapters with {num_chapters} chapters per group")
+        combined_chapters = []
+        
+        for i in range(0, len(self.chapters), num_chapters):
+            chapters_to_combine = self.chapters[i:i + num_chapters]
+            combined_text = '\n\n'.join(chapters_to_combine)
+            combined_chapters.append(combined_text)
+            print(f"Created combined chapter group {len(combined_chapters)} with {len(chapters_to_combine)} chapters")
+        
+        return combined_chapters
 
-        return True  # Indicate successful completion
+def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    try:
+        logger.info("=== Starting XTTS Training Process ===")
+        args = parse_arguments()
+        logger.info("Arguments parsed successfully")
+        
+        # Check if session exists and is reusable
+        original_session_path = Path(args.session) if args.session else None
+        reusing_session = False
+        
+        logger.info(f"Original session path: {original_session_path}")
+        
+        try:
+            if original_session_path and original_session_path.exists():
+                logger.info("Found existing session directory")
+                is_reusable, message = is_session_reusable(original_session_path)
+                logger.info(f"Session reusability check: {message}")
+                
+                if is_reusable:
+                    reusing_session = True
+                    logger.info(f"Will reuse existing session: {original_session_path}")
+                else:
+                    if not args.input:
+                        raise ValueError("--input is required when not reusing a session")
+            elif not args.input:
+                raise ValueError("Either --session (for reuse) or --input is required")
+        except Exception as e:
+            logger.error(f"Error checking session reusability: {str(e)}")
+            raise
+            
+        # Create new session path
+        try:
+            if reusing_session:
+                session_path = create_new_session_name(original_session_path, args.epochs, args.gradient)
+                logger.info(f"Creating new session based on existing one: {session_path}")
+            else:
+                session_path = create_session_folder(args.session)
+                logger.info(f"Creating new session from scratch: {session_path}")
+        except Exception as e:
+            logger.error(f"Error creating session directory: {str(e)}")
+            raise
+
+        # Initialize session data
+        session_data = {'qualifying_segments': []}
+        logger.info("Initialized empty session data")
+
+        if reusing_session:
+            logger.info("Beginning session reuse process...")
+            try:
+                # Copy files
+                if not copy_session_files(original_session_path, session_path):
+                    raise RuntimeError("Failed to copy session files")
+                logger.info("Successfully copied session files")
+                
+                # Load metadata files
+                train_csv = session_path / "databases" / "train_metadata.csv"
+                eval_csv = session_path / "databases" / "eval_metadata.csv"
+                
+                if not train_csv.exists() or not eval_csv.exists():
+                    raise FileNotFoundError("Missing CSV files after copy")
+                
+                logger.info("Loading metadata from CSV files...")
+                loaded_segments = 0
+                
+                # Load train CSV
+                try:
+                    with open(train_csv, 'r', encoding='utf-8') as f:
+                        reader = csv.reader(f, delimiter='|')
+                        next(reader)  # Skip header
+                        for row in reader:
+                            if len(row) >= 3:
+                                audio_file = Path(row[0])
+                                if not audio_file.exists():
+                                    logger.warning(f"Audio file not found: {audio_file}")
+                                    continue
+                                session_data['qualifying_segments'].append({
+                                    'audio_file': str(audio_file),
+                                    'text': row[1],
+                                    'speaker_name': row[2]
+                                })
+                                loaded_segments += 1
+                    
+                    logger.info(f"Loaded {loaded_segments} segments from train CSV")
+                    
+                except Exception as e:
+                    logger.error(f"Error reading train CSV: {str(e)}")
+                    raise
+                
+                # Create new session files
+                logger.info("Creating new session files...")
+                log_file = create_log_file(session_path)
+                json_file = create_json_file(session_path)
+                
+                with open(json_file, 'w') as f:
+                    json.dump(session_data, f)
+                logger.info("Created new session files")
+
+                if args.prepare_dataset:
+                    logger.info("Dataset preparation completed. Skipping training as --prepare_dataset was specified.")
+                    return True
+                
+            except Exception as e:
+                logger.error(f"Error during session reuse: {str(e)}")
+                raise
+        else:
+            logger.info("Processing new session...")
+            try:
+                # Process new audio files
+                log_file = create_log_file(session_path)
+                json_file = create_json_file(session_path)
+                
+                with open(json_file, 'w') as f:
+                    json.dump(session_data, f)
+
+                logger.info("Processing audio files...")
+                audio_sources_dir = process_audio(args.input, session_path, args)
+                if not audio_sources_dir:
+                    raise RuntimeError("Audio processing failed")
+
+                # Process each audio file
+                total_segments = 0
+                audio_files = list(audio_sources_dir.glob('*.wav'))
+                logger.info(f"Found {len(audio_files)} audio files to process")
+                
+                for audio_file in audio_files:
+                    logger.info(f"Processing {audio_file.name}...")
+                    try:
+                        json_file = transcribe_audio(audio_file, args, session_path)
+                        segments_count = parse_transcription(
+                            json_file, 
+                            audio_file, 
+                            audio_sources_dir / "processed", 
+                            session_data, 
+                            args.sample_method,
+                            args
+                        )
+                        total_segments += segments_count
+                        logger.info(f"Added {segments_count} segments from {audio_file.name}")
+                    except Exception as e:
+                        logger.error(f"Error processing {audio_file.name}: {str(e)}")
+                        continue
+
+                logger.info(f"Total segments processed: {total_segments}")
+
+                # Create metadata files
+                logger.info("Creating metadata files...")
+                train_csv, eval_csv = create_metadata_files(
+                    session_data, 
+                    session_path,
+                    args.training_proportion
+                )
+
+                if train_csv is None or eval_csv is None:
+                    raise RuntimeError("Failed to create metadata files")
+
+                if args.prepare_dataset:
+                    logger.info("Dataset preparation completed. Skipping training as --prepare_dataset was specified.")
+                    return True
+                
+            except Exception as e:
+                logger.error(f"Error processing new session: {str(e)}")
+                raise
+
+        # Prepare for training
+        logger.info("Beginning training preparation...")
+        try:
+            # Clear GPU memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+                gc.collect()
+                
+                logger.info(f"GPU Memory - Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f}MB, "
+                          f"Cached: {torch.cuda.memory_reserved() / 1024**2:.2f}MB")
+
+            # Create model directory
+            models_dir = session_path / "models"
+            models_dir.mkdir(exist_ok=True)
+
+            model_name = args.xtts_model_name or f"xtts_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            model_output_path = models_dir / model_name
+            logger.info(f"Model will be saved to: {model_output_path}")
+
+            # Download base models
+            logger.info("Downloading base models...")
+            base_model_path = Path.cwd() / "base_models" / args.xtts_base_model
+            download_models(base_model_path, args.xtts_base_model)
+
+            # Start training
+            logger.info("Starting model training...")
+            speaker_file, config_file, checkpoint_file, tokenizer_file, training_output_path = train_gpt(
+                custom_model="",
+                version=args.xtts_base_model,
+                language=args.source_language,
+                num_epochs=args.epochs,
+                batch_size=args.batch,
+                grad_acumm=args.gradient,
+                train_csv=str(train_csv),
+                eval_csv=str(eval_csv),
+                output_path=str(model_output_path),
+                sample_rate=args.sample_rate,
+                model_name=model_name,
+                max_audio_time=args.max_audio_time,
+                max_text_length=args.max_text_length,
+                learning_rate=args.learning_rate,
+                scheduler=args.scheduler,
+            )
+
+            logger.info("Optimizing trained model...")
+            optimization_message, optimized_model_path = optimize_model(model_output_path, base_model_path)
+
+            logger.info(f"Training completed. Model saved at: {model_output_path}")
+            logger.info(optimization_message)
+
+            if optimized_model_path:  
+                logger.info("Copying reference samples...")
+                copy_reference_samples(
+                    session_path / "audio_sources" / "processed", 
+                    session_path, 
+                    session_data
+                )
+                logger.info("Reference samples copied successfully")
+            else:
+                logger.warning("Optimized model path not found. Reference samples not copied.")
+
+            logger.info("=== Training Process Completed Successfully ===")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error during training phase: {str(e)}")
+            logger.error("Stack trace:", exc_info=True)
+            raise
 
     except Exception as e:
-        print(f"An unexpected error occurred: {str(e)}")
+        logger.error("=== Training Process Failed ===")
+        logger.error(f"Error: {str(e)}")
+        logger.error("Stack trace:", exc_info=True)
         return False
 
 if __name__ == "__main__":
@@ -2026,10 +2689,11 @@ if __name__ == "__main__":
         success = main()
         if success:
             print("Training process completed successfully.")
-            sys.exit(0)  # Exit with success code
+            sys.exit(0)
         else:
             print("Training process failed.")
-            sys.exit(1)  # Exit with error code
+            sys.exit(1)
     except Exception as e:
         print(f"An unexpected error occurred: {str(e)}")
-        sys.exit(1)  # Exit with error code
+        traceback.print_exc()
+        sys.exit(1)
