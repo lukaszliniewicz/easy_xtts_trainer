@@ -1022,6 +1022,13 @@ def parse_arguments():
                        help="Only prepare the dataset without starting training")
     parser.add_argument("--min-gap", type=int, metavar="MS",
                        help="Minimum gap in milliseconds required between segments")
+    parser.add_argument("--voice-sample-mode", choices=["basic", "extended", "dynamic"], default="basic",
+                    help="Mode for organizing voice samples (basic: 2 files in main directory, extended: specialized samples by characteristic, dynamic: samples with internal variation)")
+    parser.add_argument("--voice-samples", type=int, choices=[3, 4], default=3,
+                    help="Number of reference voice samples to save in extended/dynamic mode (default: 3)")
+    parser.add_argument("--voice-sample-only-sentence", action="store_true",
+                        help="Only use complete sentences (starting with capital letter and ending with sentence punctuation) for voice samples")
+    
     
     args = parser.parse_args()
 
@@ -2097,55 +2104,363 @@ def optimize_model(out_path, base_model_path):
 
     return f"Model optimized and saved at {optimized_model}!", str(optimized_model)
 
-def copy_reference_samples(processed_dir, session_path, session_data):
+def copy_reference_samples(processed_dir, session_path, session_data, args):
+    """Copy reference voice samples according to the specified mode."""
+    # Import required libraries
+    import numpy as np
+    import librosa
+    import shutil
+    from pathlib import Path
+    import random
+    
+    # Get parameters
+    voice_sample_mode = getattr(args, 'voice_sample_mode', 'basic')
+    voice_samples = getattr(args, 'voice_samples', 3)
+    only_sentences = getattr(args, 'voice_sample_only_sentence', False)
+    
     pandrator_voices_dir = Path("../Pandrator/tts_voices")
     if not pandrator_voices_dir.exists():
-        print("Pandrator tts_voices directory does not exist. Skipping reference sample copying.")
+        print("Pandrator tts_voices directory not found. Skipping reference sample copying.")
         return
 
-    # Get session name for file naming
+    # Get session name for file naming - always use session name for consistency
     session_name = session_path.name
+    
+    print(f"\nSelecting voice samples with mode: {voice_sample_mode}, count: {voice_samples if voice_sample_mode != 'basic' else 2}")
+    if only_sentences:
+        print("Filtering for complete sentences (capital letter + ending punctuation)")
 
-    # Get all wav files and their corresponding segments from session_data
+    # Get all wav files and their corresponding segments
     wav_files = []
+    skipped_files = 0
+    
     for wav_file in processed_dir.glob('*.wav'):
-        # Find corresponding text in session_data
         segment = next((seg for seg in session_data['qualifying_segments'] 
                        if Path(seg['audio_file']).name == wav_file.name), None)
         if segment:
-            wav_files.append({
-                'path': wav_file,
-                'size': wav_file.stat().st_size,
-                'text': segment['text'],
-                'duration': AudioSegment.from_wav(wav_file).duration_seconds
-            })
+            # Check if we should only use complete sentences
+            if only_sentences:
+                text = segment['text'].strip()
+                # Check if text starts with capital letter
+                starts_with_capital = text and text[0].isupper()
+                
+                # Check for sentence-ending punctuation, including when followed by closing quotes/parentheses
+                ends_with_punctuation = False
+                if text:
+                    if text[-1] in '.!?':
+                        ends_with_punctuation = True
+                    elif len(text) >= 2 and text[-2] in '.!?' and text[-1] in '"\')':
+                        ends_with_punctuation = True
+                    elif len(text) >= 3 and text[-3] in '.!?' and text[-2:] in [')"', ')\'', '")', '\')', ').', '").']:
+                        ends_with_punctuation = True
+                
+                if not (starts_with_capital and ends_with_punctuation):
+                    skipped_files += 1
+                    continue  # Skip this segment
+            
+            try:
+                # Calculate basic audio properties
+                y, sr = librosa.load(wav_file, sr=None)
+                duration = librosa.get_duration(y=y, sr=sr)
+                
+                # Calculate pitch 
+                pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+                pitch_indices = np.argmax(magnitudes, axis=0)
+                pitches_by_frame = pitches[pitch_indices, range(len(pitch_indices))]
+                pitches_by_frame = pitches_by_frame[pitches_by_frame > 0]
+                avg_pitch = np.mean(pitches_by_frame) if len(pitches_by_frame) > 0 else 0
+                
+                wav_files.append({
+                    'path': wav_file,
+                    'size': wav_file.stat().st_size,
+                    'text': segment['text'],
+                    'duration': duration,
+                    'avg_pitch': avg_pitch,
+                    'speech_rate': len(segment['text']) / duration if duration > 0 else 0
+                })
+            except Exception as e:
+                print(f"Error analyzing {wav_file}: {e}")
+                continue
 
-    # Sort files by size in descending order
-    wav_files.sort(key=lambda x: x['size'], reverse=True)
-
-    # Select one random file from top 10%
-    top_10_percent = wav_files[:max(1, len(wav_files) // 10)]
-    random_long = random.choice(top_10_percent)
+    if only_sentences:
+        print(f"Sentence filtering: skipped {skipped_files} segments, kept {len(wav_files)} eligible segments")
     
-    # Copy the random long sample
-    shutil.copy2(random_long['path'], pandrator_voices_dir / f"{session_name}.wav")
-
-    # Get top 70% by length for speech rate calculation
-    top_70_percent = wav_files[:int(len(wav_files) * 0.7)]
+    if not wav_files:
+        print("No valid audio files found for reference samples.")
+        return
     
-    # Calculate speech rate (characters per second) for each file
-    for file in top_70_percent:
-        file['speech_rate'] = len(file['text']) / file['duration']
-
-    # Find the file with highest speech rate
-    fastest = max(top_70_percent, key=lambda x: x['speech_rate'])
+    print(f"Found {len(wav_files)} valid audio files for analysis.")
     
-    # Copy the fastest sample
-    shutil.copy2(fastest['path'], pandrator_voices_dir / f"{session_name}_fastest.wav")
+    # Handle based on selected mode
+    if voice_sample_mode == 'basic':
+        # Original basic mode logic (always 2 samples)
+        # Sort files by size in descending order
+        wav_files.sort(key=lambda x: x['size'], reverse=True)
 
-    print(f"Copied reference samples to {pandrator_voices_dir}:")
-    print(f"Long sample: {random_long['path'].name}")
-    print(f"Fastest sample: {fastest['path'].name} (speech rate: {fastest['speech_rate']:.2f} chars/sec)")
+        # Select one random file from top 10%
+        top_10_percent = wav_files[:max(1, len(wav_files) // 10)]
+        random_long = random.choice(top_10_percent)
+        
+        # Copy the random long sample
+        shutil.copy2(random_long['path'], pandrator_voices_dir / f"{session_name}.wav")
+
+        # Get top 70% by length for speech rate calculation
+        top_70_percent = wav_files[:int(len(wav_files) * 0.7)]
+        
+        # Find the file with highest speech rate
+        fastest = max(top_70_percent, key=lambda x: x['speech_rate'])
+        
+        # Copy the fastest sample
+        shutil.copy2(fastest['path'], pandrator_voices_dir / f"{session_name}_fastest.wav")
+
+        print(f"Copied reference samples to {pandrator_voices_dir} (basic mode):")
+        print(f"Long sample: {random_long['path'].name} ({random_long['duration']:.2f}s)")
+        print(f"Fastest sample: {fastest['path'].name} (speech rate: {fastest['speech_rate']:.2f} chars/sec)")
+        
+    elif voice_sample_mode == 'extended':
+        # Extended mode logic for 3-4 specialized samples
+        # Create folder for this model's samples
+        model_samples_dir = pandrator_voices_dir / session_name
+        model_samples_dir.mkdir(exist_ok=True)
+        
+        # Sort by size for length-based selections
+        wav_files.sort(key=lambda x: x['size'], reverse=True)
+        
+        # Get top 70% by length for advanced selection
+        top_70_percent = wav_files[:int(len(wav_files) * 0.7)]
+        selected_samples = []
+        
+        # 1. Fast sample - highest speech rate from top 70%
+        fastest = max(top_70_percent, key=lambda x: x['speech_rate'])
+        shutil.copy2(fastest['path'], model_samples_dir / f"{session_name}_fast.wav")
+        selected_samples.append(fastest['path'])
+        
+        # 2. Low pitch sample - from top 70% length files, avoiding bottom 10% pitch
+        pitch_sorted = sorted(top_70_percent, key=lambda x: x['avg_pitch'])
+        skip_count = max(0, int(len(pitch_sorted) * 0.1))
+        
+        # Find low pitch sample not already selected
+        low_pitch_candidates = [s for s in pitch_sorted[skip_count:] if s['path'] not in selected_samples]
+        if low_pitch_candidates:
+            low_pitch_sample = low_pitch_candidates[0]  # First eligible low pitch sample
+            shutil.copy2(low_pitch_sample['path'], model_samples_dir / f"{session_name}_low.wav")
+            selected_samples.append(low_pitch_sample['path'])
+        
+        # 3. Slow sample (part of the minimum 3 samples in extended mode)
+        # Sort by speech rate, exclude bottom 10% to avoid outliers
+        speech_rates = sorted([f['speech_rate'] for f in top_70_percent])
+        min_valid_rate = speech_rates[max(0, int(len(speech_rates) * 0.1))]
+        
+        valid_slow_samples = [f for f in top_70_percent 
+                             if f['speech_rate'] >= min_valid_rate and f['path'] not in selected_samples]
+        if valid_slow_samples:
+            slowest = min(valid_slow_samples, key=lambda x: x['speech_rate'])
+            shutil.copy2(slowest['path'], model_samples_dir / f"{session_name}_slow.wav")
+            selected_samples.append(slowest['path'])
+        
+        # 4. High pitch sample if requested (for 4 samples mode)
+        if voice_samples >= 4:
+            # Reverse pitch sort, skip top 10% to avoid distortion
+            pitch_sorted.reverse()
+            skip_count = max(0, int(len(pitch_sorted) * 0.1))
+            
+            # Find high pitch sample not already selected
+            high_pitch_candidates = [s for s in pitch_sorted[skip_count:] if s['path'] not in selected_samples]
+            if high_pitch_candidates:
+                high_pitch_sample = high_pitch_candidates[0]
+                shutil.copy2(high_pitch_sample['path'], model_samples_dir / f"{session_name}_high.wav")
+                selected_samples.append(high_pitch_sample['path'])
+        
+        print(f"Copied {len(selected_samples)} reference samples to {model_samples_dir} (extended mode):")
+        for sample_path in selected_samples:
+            sample = next(s for s in wav_files if s['path'] == sample_path)
+            sample_type = ""
+            if sample_path == fastest['path']:
+                sample_type = "fast"
+            elif 'low_pitch_sample' in locals() and sample_path == low_pitch_sample['path']:
+                sample_type = "low pitch"
+            elif 'slowest' in locals() and sample_path == slowest['path']:
+                sample_type = "slow"
+            elif 'high_pitch_sample' in locals() and sample_path == high_pitch_sample['path']:
+                sample_type = "high pitch"
+                
+            print(f"- {sample_path.name} ({sample_type}): {sample['duration']:.2f}s, {sample['speech_rate']:.2f} chars/sec")
+        
+    else:  # dynamic mode
+        # Create folder for this model's samples
+        model_samples_dir = pandrator_voices_dir / session_name
+        model_samples_dir.mkdir(exist_ok=True)
+        
+        # Analyze dynamic variation
+        dynamic_samples = analyze_dynamic_variation(wav_files)
+        
+        # Select samples with dynamic internal variation
+        selected_dynamic_samples = select_dynamic_samples(dynamic_samples, voice_samples)
+        
+        # Copy the selected samples
+        print(f"\nCopying {len(selected_dynamic_samples)} dynamic variation samples to {model_samples_dir}:")
+        for i, sample in enumerate(selected_dynamic_samples, 1):
+            output_file = model_samples_dir / f"{session_name}_dynamic_{i}.wav"
+            shutil.copy2(sample['path'], output_file)
+            
+            # Print details about the selected sample
+            pitch_var = sample.get('pitch_variation', 0)
+            speed_var = sample.get('speed_variation', 0)
+            rhythm_var = sample.get('rhythm_variation', 0)
+            
+            print(f"  {i}. {sample['path'].name}")
+            print(f"     Duration: {sample['duration']:.2f}s, Text: \"{sample['text'][:50]}{'...' if len(sample['text']) > 50 else ''}\"")
+            print(f"     Variation scores - Pitch: {pitch_var:.3f}, Speed: {speed_var:.3f}, Rhythm: {rhythm_var:.3f}")
+            print(f"     Dynamic score: {sample.get('dynamic_score', 0):.3f}")
+
+def analyze_dynamic_variation(samples):
+    """Analyze internal variation within each sample and mark outliers."""
+    # Calculate variation metrics for each sample
+    for sample in samples:
+        try:
+            y, sr = librosa.load(sample['path'], sr=None)
+            
+            # 1. Pitch Variation (how much pitch changes within the sample)
+            pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+            pitch_indices = np.argmax(magnitudes, axis=0)
+            pitches = pitches[pitch_indices, range(len(pitch_indices))]
+            pitches = pitches[pitches > 0]  # Remove zero values
+            
+            # Calculate how much pitch changes over time
+            sample['pitch_variation'] = np.std(pitches) / np.mean(pitches) if len(pitches) > 0 and np.mean(pitches) > 0 else 0
+            
+            # 2. Speed Variation (changes in speaking rate)
+            # Divide audio into segments and analyze energy patterns
+            num_chunks = max(3, int(sample['duration'] / 2))  # ~2 second chunks
+            if len(y) > num_chunks and num_chunks > 1:
+                chunk_size = len(y) // num_chunks
+                energy_per_chunk = []
+                
+                for i in range(num_chunks):
+                    chunk = y[i*chunk_size:min((i+1)*chunk_size, len(y))]
+                    # Calculate local energy in this segment
+                    energy_per_chunk.append(np.sum(np.abs(chunk)))
+                
+                # How much energy (proxy for speaking rate) varies
+                sample['speed_variation'] = np.std(energy_per_chunk) / np.mean(energy_per_chunk) if np.mean(energy_per_chunk) > 0 else 0
+            else:
+                sample['speed_variation'] = 0
+            
+            # 3. Rhythm/Prosody Variation
+            # Detect onsets (beginnings of syllables/words)
+            onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+            # Analyze how regularly spaced these onsets are
+            tempogram = librosa.feature.tempogram(onset_envelope=onset_env, sr=sr)
+            sample['rhythm_variation'] = np.std(np.mean(tempogram, axis=0)) if tempogram.size > 0 else 0
+            
+            # 4. Text-based indications of variation
+            text = sample['text']
+            # Count different punctuation types (proxy for different speaking styles)
+            question_marks = text.count('?')
+            exclamations = text.count('!')
+            periods = text.count('.')
+            commas = text.count(',')
+            
+            # Does the sample contain different sentence types?
+            has_variety = (question_marks > 0) + (exclamations > 0) + (periods > 0) > 1
+            punctuation_density = (question_marks + exclamations + periods + commas) / len(text) if len(text) > 0 else 0
+            
+            # 5. Dynamic composite score
+            sample['dynamic_score'] = (
+                0.30 * sample['pitch_variation'] + 
+                0.30 * sample['speed_variation'] + 
+                0.25 * sample['rhythm_variation'] + 
+                0.15 * (punctuation_density * 10 + (0.5 if has_variety else 0))  # Scale up text factors
+            )
+            
+        except Exception as e:
+            print(f"Error analyzing sample {sample['path'].name}: {e}")
+            # Set default values if analysis fails
+            sample['pitch_variation'] = 0
+            sample['speed_variation'] = 0 
+            sample['rhythm_variation'] = 0
+            sample['dynamic_score'] = 0
+    
+    # Now identify outliers for each metric
+    for metric in ['pitch_variation', 'speed_variation', 'rhythm_variation', 'dynamic_score']:
+        if not samples:
+            continue
+            
+        values = [s[metric] for s in samples if metric in s]
+        if not values:
+            continue
+            
+        # Sort values to identify percentile thresholds
+        values.sort()
+        
+        # Get 10th and 90th percentile values
+        low_threshold_idx = max(0, int(len(values) * 0.1))
+        high_threshold_idx = min(len(values) - 1, int(len(values) * 0.9))
+        
+        low_threshold = values[low_threshold_idx]
+        high_threshold = values[high_threshold_idx]
+        
+        # Mark outliers
+        for sample in samples:
+            if metric in sample:
+                # Samples are outliers if they're in the bottom or top 10%
+                if sample[metric] < low_threshold or sample[metric] > high_threshold:
+                    sample[f'{metric}_outlier'] = True
+                else:
+                    sample[f'{metric}_outlier'] = False
+    
+    return samples
+
+def select_dynamic_samples(samples, target_count=3):
+    """Select samples with internal variation while avoiding outliers."""
+    if not samples:
+        return []
+        
+    # Filter to quality samples (top 70% by size/duration)
+    samples.sort(key=lambda x: x['size'], reverse=True)
+    quality_samples = samples[:max(5, int(len(samples) * 0.7))]
+    
+    # Remove samples that are outliers in multiple dimensions
+    normal_samples = []
+    mild_outliers = []  # Outliers in just one dimension
+    extreme_outliers = []  # Outliers in multiple dimensions
+    
+    for sample in quality_samples:
+        # Count how many dimensions this sample is an outlier in
+        outlier_count = sum(1 for metric in ['pitch_variation', 'speed_variation', 
+                                          'rhythm_variation', 'dynamic_score'] 
+                          if sample.get(f'{metric}_outlier', False))
+        
+        if outlier_count == 0:
+            normal_samples.append(sample)
+        elif outlier_count == 1:
+            mild_outliers.append(sample)
+        else:
+            extreme_outliers.append(sample)
+    
+    # Prioritize samples with the best dynamic scores among non-outliers
+    normal_samples.sort(key=lambda x: x['dynamic_score'], reverse=True)
+    
+    # Start with best normal samples
+    selected = normal_samples[:target_count]
+    
+    # If we don't have enough, add mild outliers
+    if len(selected) < target_count:
+        mild_outliers.sort(key=lambda x: x['dynamic_score'], reverse=True)
+        selected.extend(mild_outliers[:target_count - len(selected)])
+    
+    # If we still don't have enough, reluctantly add extreme outliers
+    if len(selected) < target_count and extreme_outliers:
+        extreme_outliers.sort(key=lambda x: x['dynamic_score'], reverse=True)
+        selected.extend(extreme_outliers[:target_count - len(selected)])
+    
+    # Final check - if we somehow ended up with too few, add any remaining samples
+    if len(selected) < target_count:
+        remaining = [s for s in samples if s not in selected]
+        remaining.sort(key=lambda x: x['dynamic_score'], reverse=True)
+        selected.extend(remaining[:target_count - len(selected)])
+    
+    return selected[:target_count]
 
 def is_session_reusable(session_path: Path) -> Tuple[bool, str]:
     """
@@ -2664,7 +2979,8 @@ def main():
                 copy_reference_samples(
                     session_path / "audio_sources" / "processed", 
                     session_path, 
-                    session_data
+                    session_data,
+                    args
                 )
                 logger.info("Reference samples copied successfully")
             else:
