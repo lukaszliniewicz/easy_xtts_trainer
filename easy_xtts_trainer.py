@@ -2104,6 +2104,55 @@ def optimize_model(out_path, base_model_path):
 
     return f"Model optimized and saved at {optimized_model}!", str(optimized_model)
 
+def copy_model_to_xtts_server(model_path, session_name):
+    """
+    Copy model files to the XTTS API server directory.
+    """
+    try:
+        # Check if XTTS API server models directory exists
+        xtts_server_dir = Path("../xtts-api-server/xtts_models")
+        if not xtts_server_dir.exists():
+            print(f"XTTS API server directory not found: {xtts_server_dir}")
+            return None
+        
+        # Create a directory for this model using the session name
+        target_dir = xtts_server_dir / session_name
+        target_dir.mkdir(exist_ok=True)
+        
+        print(f"Copying model files to XTTS server directory: {target_dir}")
+        
+        # Files to copy (skipping the 'run' directory)
+        files_to_copy = [
+            "model.pth",
+            "speakers_xtts.pth", 
+            "config.json", 
+            "vocab.json"
+        ]
+        
+        for file in files_to_copy:
+            src = model_path / file
+            if src.exists():
+                dst = target_dir / file
+                print(f"Copying {file}...")
+                shutil.copy2(src, dst)
+                if dst.exists():
+                    print(f"  Success: {dst} ({dst.stat().st_size} bytes)")
+                else:
+                    print(f"  Failed to copy {file}")
+            else:
+                print(f"Warning: Source file not found: {src}")
+        
+        # Verify the copy
+        copied_files = list(target_dir.glob("*"))
+        print(f"Copied {len(copied_files)} of {len(files_to_copy)} required files to {target_dir}")
+        
+        return target_dir
+    
+    except Exception as e:
+        print(f"Error copying model to XTTS server: {str(e)}")
+        traceback.print_exc()
+        return None
+
 def copy_reference_samples(processed_dir, session_path, session_data, args):
     """Copy reference voice samples according to the specified mode."""
     # Import required libraries
@@ -2974,7 +3023,16 @@ def main():
             logger.info(f"Training completed. Model saved at: {model_output_path}")
             logger.info(optimization_message)
 
-            if optimized_model_path:  
+            if optimized_model_path:
+                logger.info("Copying model to XTTS API server...")
+                xtts_server_model_path = copy_model_to_xtts_server(model_output_path, session_path.name)
+                
+                if xtts_server_model_path:
+                    logger.info(f"Model successfully copied to XTTS server at: {xtts_server_model_path}")
+                else:
+                    logger.warning("Failed to copy model to XTTS server. Please copy manually.")
+                
+                # Then proceed with copying reference samples
                 logger.info("Copying reference samples...")
                 copy_reference_samples(
                     session_path / "audio_sources" / "processed", 
