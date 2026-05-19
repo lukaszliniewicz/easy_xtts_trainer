@@ -360,6 +360,60 @@ def get_dataset_size(train_csv: str) -> int:
         print(f"Error reading CSV file: {e}")
         return 0
 
+
+def _peek_first_audio_path(metadata_csv_path: Path) -> Optional[Path]:
+    """Read the first audio path from a metadata CSV file."""
+    try:
+        with open(metadata_csv_path, 'r', encoding='utf-8', newline='') as handle:
+            reader = csv.DictReader(handle, delimiter='|')
+            for row in reader:
+                raw_audio_path = (row.get('audio_file') or '').strip()
+                if not raw_audio_path:
+                    continue
+
+                audio_path = Path(raw_audio_path)
+                if not audio_path.is_absolute():
+                    audio_path = (metadata_csv_path.parent / audio_path).resolve()
+                return audio_path
+    except Exception:
+        return None
+
+    return None
+
+
+def _build_dataset_config_paths(train_csv: str, eval_csv: str) -> tuple[Path, str, str]:
+    """Build dataset root and metadata paths expected by the Coqui formatter."""
+    train_csv_path = Path(train_csv).resolve()
+    eval_csv_path = Path(eval_csv).resolve()
+
+    # Metadata files are normally stored in <session>/databases.
+    if train_csv_path.parent.name.lower() == "databases":
+        dataset_root = train_csv_path.parent.parent
+    else:
+        dataset_root = train_csv_path.parent
+
+    first_audio_path = _peek_first_audio_path(train_csv_path) or _peek_first_audio_path(eval_csv_path)
+    if first_audio_path is not None:
+        try:
+            first_audio_path.relative_to(dataset_root)
+        except ValueError:
+            try:
+                dataset_root = Path(os.path.commonpath([str(dataset_root), str(first_audio_path)]))
+            except ValueError:
+                pass
+
+    try:
+        meta_file_train = str(train_csv_path.relative_to(dataset_root))
+    except ValueError:
+        meta_file_train = train_csv_path.name
+
+    try:
+        meta_file_val = str(eval_csv_path.relative_to(dataset_root))
+    except ValueError:
+        meta_file_val = eval_csv_path.name
+
+    return dataset_root, meta_file_train, meta_file_val
+
 def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acumm, 
               train_csv, eval_csv, output_path, sample_rate, model_name, max_audio_time,
               max_text_length, learning_rate=5e-06, scheduler=None):
@@ -373,12 +427,14 @@ def train_gpt(custom_model, version, language, num_epochs, batch_size, grad_acum
     CHECKPOINTS_OUT_PATH = os.path.join(Path.cwd(), "base_models", f"{version}")
     os.makedirs(CHECKPOINTS_OUT_PATH, exist_ok=True)
 
+    dataset_root, meta_file_train, meta_file_val = _build_dataset_config_paths(train_csv, eval_csv)
+
     config_dataset = BaseDatasetConfig(
         formatter="coqui",
         dataset_name="ft_dataset",
-        path=os.path.dirname(train_csv),
-        meta_file_train=os.path.basename(train_csv),
-        meta_file_val=os.path.basename(eval_csv),
+        path=str(dataset_root),
+        meta_file_train=meta_file_train,
+        meta_file_val=meta_file_val,
         language=language,
     )
     DATASETS_CONFIG_LIST = [config_dataset]
