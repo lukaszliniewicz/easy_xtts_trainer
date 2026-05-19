@@ -34,6 +34,9 @@ Optional features:
 # Optional: denoise support (only on supported Python/platform wheels)
 pip install DeepFilterNet==0.5.6 DeepFilterLib==0.5.6
 
+# Optional: breath removal support for --breath
+pip install "breath-removal @ git+https://github.com/lukaszliniewicz/breath-removal.git@4f3cda4936ae09ec50af010853577fdd4472fd6a"
+
 # Optional: source-text alignment (requires ffmpeg on PATH; prefer vendored prebuilt wheel)
 pip install ./vendor/ctc_forced_aligner-0.3.0-cp313-cp313-win_amd64.whl
 
@@ -113,6 +116,7 @@ This prevents destructive over-correction while still improving proper nouns and
 | `--max-audio-time` | Max segment duration (seconds) | `11` |
 | `--max-text-length` | Max segment text length (chars) | `200` |
 | `--denoise` | Enable DeepFilterNet denoise (optional dependency) | off |
+| `--breath` | Enable breath-removal preprocessing (optional dependency) | off |
 | `--dess` | De-esser | off |
 | `--normalize` | Target LUFS normalization | unset (or `-16.0` when flag is used without value) |
 | `--compress` | Compression profile (`male`, `female`, `neutral`) | off |
@@ -128,4 +132,5 @@ python -m pytest
 
 - `ctc-forced-aligner` is optional by design.
 - If DeepFilter is unavailable, `--denoise` prints a warning and processing continues.
+- If breath-removal is unavailable, `--breath` prints a warning and processing continues.
 - For Pandrator installations, prefer leaving WhisperX runner mode on `auto`.

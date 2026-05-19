@@ -25,8 +25,8 @@ beautifulsoup4==4.13.3
 bs4==0.0.2
 EbookLib==0.18
 
-# Git repositories
-breath-removal @ git+https://github.com/lukaszliniewicz/breath-removal.git@4f3cda4936ae09ec50af010853577fdd4472fd6a
+# Optional dependency for --breath preprocessing:
+# pip install "breath-removal @ git+https://github.com/lukaszliniewicz/breath-removal.git@4f3cda4936ae09ec50af010853577fdd4472fd6a"
 
 # Optional dependency for --source-text alignment.
 # Runtime prerequisite: ffmpeg executable must be available on PATH.

@@ -97,3 +97,34 @@ def test_process_audio_disambiguates_duplicate_stems(tmp_path: Path, monkeypatch
     assert len(set(converted_output_names)) == 2
     assert "chapter01.wav" in converted_output_names
     assert any(name.startswith("chapter01__") and name.endswith(".wav") for name in converted_output_names)
+
+
+def test_process_audio_continues_without_breath_tool(tmp_path: Path, monkeypatch) -> None:
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "one.mp3").write_bytes(b"x")
+
+    converted_inputs: list[str] = []
+
+    def fake_convert(input_path: Path, output_path: Path, target_sample_rate: int) -> None:
+        _ = target_sample_rate
+        converted_inputs.append(input_path.name)
+        output_path.write_bytes(b"wav")
+
+    def fake_subprocess_run(command, *args, **kwargs):
+        _ = args, kwargs
+        if command and command[0] == "breath-removal":
+            raise FileNotFoundError("breath-removal not installed")
+        raise AssertionError(f"Unexpected command: {command}")
+
+    monkeypatch.setattr(preprocessing, "convert_to_wav", fake_convert)
+    monkeypatch.setattr(preprocessing.subprocess, "run", fake_subprocess_run)
+
+    session_path = tmp_path / "session"
+    config = _dataset_config(sample_rate=22050, breath=True)
+    audio_sources_dir = preprocessing.process_audio(str(input_dir), session_path, config)
+
+    assert audio_sources_dir == session_path / "audio_sources"
+    assert converted_inputs == ["one.mp3"]
+    assert (session_path / "audio_sources" / "one.wav").exists()
+    assert not (session_path / "audio_sources" / "breath_removal_temp").exists()
