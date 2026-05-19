@@ -120,11 +120,19 @@ def prepare_source_text_for_audio(
     # Kept for signature/backward compatibility with existing call sites.
     _ = audio_file
 
+    chapters_per_group = max(1, chapter_per_audio)
+    temp_text_dir = session_path / "temp_source_text"
+    temp_text_dir.mkdir(exist_ok=True)
+    temp_text_path = temp_text_dir / f"{source_text_path.stem}_full_c{chapters_per_group}.txt"
+
+    if temp_text_path.exists() and temp_text_path.stat().st_size > 0:
+        print(f"Reusing cached full-source text file: {temp_text_path}")
+        return temp_text_path
+
     print(f"Processing epub file: {source_text_path}")
     epub_processor = EpubProcessor()
     epub_processor.process_epub(source_text_path)
 
-    chapters_per_group = max(1, chapter_per_audio)
     combined_chapters = epub_processor.get_combined_chapters(chapters_per_group)
     if not combined_chapters:
         raise ValueError("No chapters were extracted from the epub file")
@@ -132,10 +140,6 @@ def prepare_source_text_for_audio(
     full_source_text = "\n\n".join(combined_chapters).strip()
     if not full_source_text:
         raise ValueError("No usable text content was extracted from the epub file")
-
-    temp_text_dir = session_path / "temp_source_text"
-    temp_text_dir.mkdir(exist_ok=True)
-    temp_text_path = temp_text_dir / f"{source_text_path.stem}_full.txt"
 
     print(f"Creating temporary full-source text file: {temp_text_path}")
     with open(temp_text_path, "w", encoding="utf-8") as handle:

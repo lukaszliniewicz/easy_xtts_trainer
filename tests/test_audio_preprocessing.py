@@ -71,3 +71,29 @@ def test_process_audio_uses_converter_for_each_discovered_file(tmp_path: Path, m
     assert all(sample_rate == 44100 for _, _, sample_rate in converted)
     assert (session_path / "audio_sources" / "one.wav").exists()
     assert (session_path / "audio_sources" / "two.wav").exists()
+
+
+def test_process_audio_disambiguates_duplicate_stems(tmp_path: Path, monkeypatch) -> None:
+    input_dir = tmp_path / "input"
+    (input_dir / "disc_a").mkdir(parents=True)
+    (input_dir / "disc_b").mkdir(parents=True)
+    (input_dir / "disc_a" / "chapter01.mp3").write_bytes(b"a")
+    (input_dir / "disc_b" / "chapter01.flac").write_bytes(b"b")
+
+    converted_output_names: list[str] = []
+
+    def fake_convert(input_path: Path, output_path: Path, target_sample_rate: int) -> None:
+        _ = input_path, target_sample_rate
+        converted_output_names.append(output_path.name)
+        output_path.write_bytes(b"wav")
+
+    monkeypatch.setattr(preprocessing, "convert_to_wav", fake_convert)
+
+    session_path = tmp_path / "session"
+    config = _dataset_config(sample_rate=22050)
+    preprocessing.process_audio(str(input_dir), session_path, config)
+
+    assert len(converted_output_names) == 2
+    assert len(set(converted_output_names)) == 2
+    assert "chapter01.wav" in converted_output_names
+    assert any(name.startswith("chapter01__") and name.endswith(".wav") for name in converted_output_names)

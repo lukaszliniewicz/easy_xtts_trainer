@@ -52,6 +52,17 @@ class CTCAlignmentAttempt:
     ctc_data: dict
 
 
+@dataclass(frozen=True)
+class SourceTextIndex:
+    source_text: str
+    source_tokens: list[str]
+    source_spans: list[tuple[int, int]]
+    source_positions: dict[str, list[int]]
+
+
+_SOURCE_TEXT_INDEX_CACHE: dict[tuple[str, int, int], SourceTextIndex] = {}
+
+
 def map_ctc_language(source_language: str) -> str:
     return LANGUAGE_MAP.get(source_language, source_language)
 
@@ -92,6 +103,42 @@ def _tokenize_words_with_spans(text: str) -> tuple[list[str], list[tuple[int, in
         spans.append((match.start(), match.end()))
 
     return words, spans
+
+
+def _build_source_positions(source_tokens: list[str]) -> dict[str, list[int]]:
+    source_positions: dict[str, list[int]] = {}
+    for index, token in enumerate(source_tokens):
+        source_positions.setdefault(token, []).append(index)
+    return source_positions
+
+
+def load_source_text_index(source_text_path: Path) -> SourceTextIndex:
+    resolved_path = source_text_path.resolve()
+    file_stat = resolved_path.stat()
+    path_key = str(resolved_path).lower()
+    cache_key = (path_key, file_stat.st_mtime_ns, file_stat.st_size)
+
+    cached_index = _SOURCE_TEXT_INDEX_CACHE.get(cache_key)
+    if cached_index is not None:
+        return cached_index
+
+    # Remove stale entries for the same path if the source text has changed.
+    for existing_key in list(_SOURCE_TEXT_INDEX_CACHE):
+        if existing_key[0] == path_key and existing_key != cache_key:
+            del _SOURCE_TEXT_INDEX_CACHE[existing_key]
+
+    with open(resolved_path, "r", encoding="utf-8") as handle:
+        source_text = handle.read()
+
+    source_tokens, source_spans = _tokenize_words_with_spans(source_text)
+    source_index = SourceTextIndex(
+        source_text=source_text,
+        source_tokens=source_tokens,
+        source_spans=source_spans,
+        source_positions=_build_source_positions(source_tokens),
+    )
+    _SOURCE_TEXT_INDEX_CACHE[cache_key] = source_index
+    return source_index
 
 
 def extract_whisper_query_words(
@@ -162,11 +209,17 @@ def build_source_text_candidates(
     source_text: str,
     query_words: list[str],
     top_k: int = DEFAULT_CANDIDATE_TOP_K,
+    *,
+    source_tokens: Optional[list[str]] = None,
+    source_spans: Optional[list[tuple[int, int]]] = None,
+    source_positions: Optional[dict[str, list[int]]] = None,
 ) -> list[SourceTextCandidate]:
     if top_k < 1:
         return []
 
-    source_tokens, source_spans = _tokenize_words_with_spans(source_text)
+    if source_tokens is None or source_spans is None:
+        source_tokens, source_spans = _tokenize_words_with_spans(source_text)
+
     if not source_tokens:
         return []
 
@@ -181,9 +234,8 @@ def build_source_text_candidates(
             )
         ]
 
-    source_positions: dict[str, list[int]] = {}
-    for index, token in enumerate(source_tokens):
-        source_positions.setdefault(token, []).append(index)
+    if source_positions is None:
+        source_positions = _build_source_positions(source_tokens)
 
     vote_counter: dict[int, float] = defaultdict(float)
     for query_index, token in enumerate(normalized_query):
@@ -360,10 +412,12 @@ def _compute_word_coverage(ctc_data: dict, reference_word_count: int) -> float:
 
     aligned_words = 0
     for segment in ctc_data.get("segments", []):
-        if str(segment.get("text", "")).strip():
-            aligned_words += 1
+        aligned_words += len(_tokenize_words(str(segment.get("text", ""))))
 
-    return aligned_words / reference_word_count
+    if aligned_words <= 0:
+        return 0.0
+
+    return min(aligned_words, reference_word_count) / reference_word_count
 
 
 def _run_single_ctc_candidate(
@@ -401,7 +455,7 @@ def _run_single_ctc_candidate(
 
     ctc_score = score_ctc_alignment(ctc_data)
     word_coverage = _compute_word_coverage(ctc_data, reference_word_count)
-    combined_score = (0.8 * ctc_score) + (0.2 * retrieval_score)
+    combined_score = (0.75 * ctc_score) + (0.15 * retrieval_score) + (0.10 * word_coverage)
 
     return CTCAlignmentAttempt(
         source_text_path=text_path,
@@ -420,9 +474,10 @@ def _write_json_file(path: Path, payload: dict) -> None:
 
 def run_ctc_alignment(request: CTCAlignmentRequest) -> Path:
     print(f"Using source text file: {request.source_text_path}")
-    with open(request.source_text_path, "r", encoding="utf-8") as handle:
-        text_content = handle.read()
+    source_index = load_source_text_index(request.source_text_path)
+    text_content = source_index.source_text
     print(f"Text content length: {len(text_content)} characters")
+    print(f"Source token count: {len(source_index.source_tokens)}")
 
     ctc_language = map_ctc_language(request.source_language)
     print(f"Mapped language code: {request.source_language} -> {ctc_language}")
@@ -438,7 +493,14 @@ def run_ctc_alignment(request: CTCAlignmentRequest) -> Path:
     candidate_files: list[tuple[Path, float]] = []
     if query_words:
         top_k = max(1, request.candidate_top_k)
-        source_candidates = build_source_text_candidates(text_content, query_words, top_k=top_k)
+        source_candidates = build_source_text_candidates(
+            text_content,
+            query_words,
+            top_k=top_k,
+            source_tokens=source_index.source_tokens,
+            source_spans=source_index.source_spans,
+            source_positions=source_index.source_positions,
+        )
         candidate_workspace_dir = (
             request.candidate_workspace_dir
             if request.candidate_workspace_dir is not None
@@ -457,6 +519,7 @@ def run_ctc_alignment(request: CTCAlignmentRequest) -> Path:
         candidate_files = [(request.source_text_path, 0.0)]
         print("Using provided source text as a single CTC candidate")
 
+    reference_word_count = len(query_words)
     attempts: list[CTCAlignmentAttempt] = []
     for index, (candidate_file, retrieval_score) in enumerate(candidate_files, start=1):
         print(f"\n--- CTC candidate {index}/{len(candidate_files)}: {candidate_file} ---")
@@ -466,7 +529,7 @@ def run_ctc_alignment(request: CTCAlignmentRequest) -> Path:
                 text_path=candidate_file,
                 retrieval_score=retrieval_score,
                 ctc_language=ctc_language,
-                reference_word_count=len(query_words),
+                reference_word_count=reference_word_count,
             )
             attempts.append(attempt)
 
@@ -501,12 +564,16 @@ def run_ctc_alignment(request: CTCAlignmentRequest) -> Path:
         f"coverage={best_attempt.word_coverage:.3f})"
     )
 
-    if request.whisper_json_path and query_words:
+    if request.whisper_json_path:
+        use_coverage_gate = bool(query_words)
+        word_coverage = best_attempt.word_coverage if use_coverage_gate else 1.0
+        min_word_coverage = request.min_word_coverage if use_coverage_gate else 0.0
+
         if not should_use_ctc_result(
             alignment_score=best_attempt.ctc_score,
-            word_coverage=best_attempt.word_coverage,
+            word_coverage=word_coverage,
             min_alignment_score=request.min_alignment_score,
-            min_word_coverage=request.min_word_coverage,
+            min_word_coverage=min_word_coverage,
         ):
             print(
                 "Warning: CTC confidence below threshold; "

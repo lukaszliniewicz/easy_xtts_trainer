@@ -76,63 +76,77 @@ def parse_transcription(
 
         return last_timestamp - first_timestamp
 
-    def process_maximise_punctuation(current_segment: dict[str, Any] | None = None) -> int:
-        if current_segment is None:
+    def add_pending_segment(words: list[dict[str, Any]], text: str | None = None) -> bool:
+        if not words:
+            return False
+
+        segment_text = text
+        if segment_text is None:
+            segment_text = " ".join(
+                str(word.get("word", "")).strip() for word in words if str(word.get("word", "")).strip()
+            )
+
+        segment_text = segment_text.strip()
+        if not segment_text:
+            return False
+
+        pending_segments.append({"words": words.copy(), "text": segment_text})
+        return True
+
+    def process_maximise_punctuation(words_to_process: list[dict[str, Any]] | None = None) -> int:
+        segments_processed = 0
+        try:
+            words = all_words if words_to_process is None else list(words_to_process)
             current_segment = {
                 "words": [],
                 "text": "",
                 "break_points": [],
             }
 
-        segments_processed = 0
-        try:
-            words_to_process = current_segment["words"]
+            for word in words:
+                word_text = str(word.get("word", ""))
 
-            index = 0
-            while index < len(words_to_process):
-                word = words_to_process[index]
-
-                # Always add words without timestamps to current segment
+                # Always add words without timestamps to current segment.
                 if not is_valid_timestamps(word):
                     if current_segment["words"]:
                         current_segment["words"].append(word)
-                        current_segment["text"] += " " + word["word"]
-                    index += 1
+                        if word_text.strip():
+                            current_segment["text"] = (
+                                f"{current_segment['text']} {word_text}".strip()
+                                if current_segment["text"]
+                                else word_text.strip()
+                            )
                     continue
 
-                # Before adding word, check if current segment already exceeds limits
+                # Before adding the next valid word, flush oversized segment if possible.
                 if current_segment["words"]:
                     current_duration = calculate_segment_duration(current_segment["words"])
                     if current_duration > dataset_config.max_audio_time:
                         if current_segment["break_points"]:
                             optimal_break = current_segment["break_points"][-1]
-                            pending_segments.append(
-                                {
-                                    "words": optimal_break["words"],
-                                    "text": optimal_break["text"],
-                                }
-                            )
-                            segments_processed += 1
-                            # Reset segment
-                            current_segment["words"] = []
-                            current_segment["text"] = ""
-                            current_segment["break_points"] = []
-                        else:
-                            # If no valid breaks, reset and continue
-                            current_segment["words"] = []
-                            current_segment["text"] = ""
-                            current_segment["break_points"] = []
+                            if add_pending_segment(optimal_break["words"], optimal_break["text"]):
+                                segments_processed += 1
+                        current_segment = {
+                            "words": [],
+                            "text": "",
+                            "break_points": [],
+                        }
 
-                # Add word to current segment
+                # Add word to current segment.
                 current_segment["words"].append(word)
-                current_segment["text"] += " " + word["word"]
+                if word_text.strip():
+                    current_segment["text"] = (
+                        f"{current_segment['text']} {word_text}".strip()
+                        if current_segment["text"]
+                        else word_text.strip()
+                    )
 
                 duration = calculate_segment_duration(current_segment["words"])
                 text_length = len(current_segment["text"])
 
-                # Only consider words with timestamps as break points
-                if is_valid_timestamps(word) and any(p in word["word"] for p in ".!?;,-"):
-                    if not is_abbreviation(word["word"], len(word["word"]) - 1):
+                # Only consider words with timestamps as break points.
+                if any(punctuation in word_text for punctuation in ".!?;,-"):
+                    if not is_abbreviation(word_text, len(word_text) - 1):
                         if duration <= dataset_config.max_audio_time and text_length <= dataset_config.max_text_length:
                             current_segment["break_points"].append(
                                 {
@@ -142,85 +156,71 @@ def parse_transcription(
                                 }
                             )
 
-                # Check if we've exceeded limits
+                # Check if we've exceeded limits.
                 if duration > dataset_config.max_audio_time or text_length > dataset_config.max_text_length:
                     if current_segment["break_points"]:
                         optimal_break = current_segment["break_points"][-1]
-                        pending_segments.append(
-                            {
-                                "words": optimal_break["words"],
-                                "text": optimal_break["text"],
-                            }
-                        )
-                        segments_processed += 1
-                        # Reset segment with remaining words
-                        break_word_index = current_segment["words"].index(optimal_break["words"][-1])
+                        if add_pending_segment(optimal_break["words"], optimal_break["text"]):
+                            segments_processed += 1
+
+                        break_word_index = len(optimal_break["words"]) - 1
                         current_segment["words"] = current_segment["words"][break_word_index + 1 :]
-                        current_segment["text"] = " ".join(word["word"] for word in current_segment["words"])
+                        current_segment["text"] = " ".join(
+                            str(item.get("word", "")).strip()
+                            for item in current_segment["words"]
+                            if str(item.get("word", "")).strip()
+                        )
                         current_segment["break_points"] = []
                     else:
-                        # If no valid breaks, reset and continue
-                        current_segment["words"] = []
-                        current_segment["text"] = ""
-                        current_segment["break_points"] = []
+                        current_segment = {
+                            "words": [],
+                            "text": "",
+                            "break_points": [],
+                        }
 
-                index += 1
-
-            # Process any remaining segment
+            # Process any remaining segment.
             if current_segment["words"] and current_segment["break_points"]:
                 optimal_break = current_segment["break_points"][-1]
-                pending_segments.append(
-                    {
-                        "words": optimal_break["words"],
-                        "text": optimal_break["text"],
-                    }
-                )
-                segments_processed += 1
+                if add_pending_segment(optimal_break["words"], optimal_break["text"]):
+                    segments_processed += 1
 
             return segments_processed
         except Exception as exc:
             print(f"Error in maximise_punctuation: {str(exc)}")
             return 0
 
-    def process_punctuation_only(current_segment: dict[str, Any] | None = None) -> int:
+    def process_punctuation_only(words_to_process: list[dict[str, Any]] | None = None) -> int:
         segments_processed = 0
         try:
-            current_words = current_segment["words"] if current_segment else []
-            index = 0
+            words = all_words if words_to_process is None else list(words_to_process)
+            current_words: list[dict[str, Any]] = []
 
-            words_to_process = current_segment["words"] if current_segment else []
-            while index < len(words_to_process):
-                word = words_to_process[index]
+            for word in words:
+                word_text = str(word.get("word", ""))
 
-                # Always add words without timestamps to current segment
+                # Always add words without timestamps to current segment.
                 if not is_valid_timestamps(word):
                     if current_words:
                         current_words.append(word)
-                    index += 1
                     continue
 
                 current_words.append(word)
 
                 if len(current_words) >= 2:
                     duration = calculate_segment_duration(current_words)
-                    current_text = " ".join(w["word"] for w in current_words)
+                    current_text = " ".join(
+                        str(item.get("word", "")).strip() for item in current_words if str(item.get("word", "")).strip()
+                    ).strip()
 
                     if duration > dataset_config.max_audio_time or len(current_text) > dataset_config.max_text_length:
                         current_words = [word]
                         continue
 
-                    if duration >= 2.0 and is_valid_timestamps(word) and any(p in word["word"] for p in ".!?;,-"):
-                        if not is_abbreviation(word["word"], len(word["word"]) - 1):
-                            pending_segments.append(
-                                {
-                                    "words": current_words,
-                                    "text": current_text,
-                                }
-                            )
-                            segments_processed += 1
+                    if duration >= 2.0 and any(punctuation in word_text for punctuation in ".!?;,-"):
+                        if not is_abbreviation(word_text, len(word_text) - 1):
+                            if add_pending_segment(current_words, current_text):
+                                segments_processed += 1
                             current_words = []
-
-                index += 1
 
             return segments_processed
         except Exception as exc:
@@ -249,24 +249,16 @@ def parse_transcription(
 
         segments_count = 0
 
-        if split_index:
+        if split_index is not None:
             # Split the words
             first_part = all_words[: split_index + 1]
             second_part = all_words[split_index + 1 :]
 
             # Process first part with maximise-punctuation
-            first_segment = {
-                "words": first_part,
-                "text": "",
-                "break_points": [],
-            }
-            segments_count += process_maximise_punctuation(first_segment)
+            segments_count += process_maximise_punctuation(first_part)
 
             # Process second part with punctuation-only
-            second_segment = {
-                "words": second_part,
-            }
-            segments_count += process_punctuation_only(second_segment)
+            segments_count += process_punctuation_only(second_part)
         else:
             # If no good split point, use maximise-punctuation for whole file
             segments_count += process_maximise_punctuation()

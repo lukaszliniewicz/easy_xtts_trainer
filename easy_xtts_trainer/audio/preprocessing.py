@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import traceback
@@ -17,11 +18,42 @@ def collect_input_audio_files(input_path: str | Path) -> list[Path]:
     if resolved_path.is_file():
         return [resolved_path]
 
-    return [
+    return sorted(
+        [
         file_path
         for file_path in resolved_path.rglob("*")
         if file_path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
-    ]
+        ],
+        key=lambda path: str(path).lower(),
+    )
+
+
+def _build_output_filename(
+    file_path: Path,
+    input_root: Path,
+    used_output_stems: set[str],
+) -> str:
+    stem = file_path.stem
+    if stem not in used_output_stems:
+        used_output_stems.add(stem)
+        return f"{stem}.wav"
+
+    try:
+        unique_key = str(file_path.resolve().relative_to(input_root.resolve()))
+    except ValueError:
+        unique_key = str(file_path.resolve())
+
+    digest = hashlib.sha1(unique_key.encode("utf-8")).hexdigest()[:8]
+    candidate_stem = f"{stem}__{digest}"
+    suffix = 2
+
+    while candidate_stem in used_output_stems:
+        candidate_stem = f"{stem}__{digest}_{suffix}"
+        suffix += 1
+
+    used_output_stems.add(candidate_stem)
+    print(f"Detected duplicate audio stem '{stem}', writing as {candidate_stem}.wav")
+    return f"{candidate_stem}.wav"
 
 
 def convert_to_wav(input_path: Path, output_path: Path, target_sample_rate: int) -> None:
@@ -57,6 +89,7 @@ def process_audio(input_path: str | Path, session_path: Path, config: DatasetRun
     processed_dir.mkdir(exist_ok=True, parents=True)
 
     files = collect_input_audio_files(input_path)
+    input_root = Path(input_path).resolve()
     breath_removal_enabled = config.breath
 
     # Check if breath removal is available if --breath is passed
@@ -84,13 +117,16 @@ def process_audio(input_path: str | Path, session_path: Path, config: DatasetRun
         print(f"Created temporary directory for breath removal: {breath_removal_dir}")
 
     processed_files: list[Path] = []
+    used_output_stems: set[str] = set()
 
-    for file_path in files:
+    for file_index, file_path in enumerate(files, start=1):
         try:
             if breath_removal_enabled and breath_removal_available:
                 # Run breath removal
                 print(f"Processing {file_path.name} with breath removal...")
-                breath_output = breath_removal_dir / f"breath_removal_{file_path.name}"
+                file_work_dir = breath_removal_dir / f"file_{file_index:04d}"
+                file_work_dir.mkdir(exist_ok=True)
+                breath_output = file_work_dir / f"breath_removal_{file_path.name}"
 
                 try:
                     command = [
@@ -98,7 +134,7 @@ def process_audio(input_path: str | Path, session_path: Path, config: DatasetRun
                         "-i",
                         str(file_path.absolute()),
                         "-o",
-                        str(breath_removal_dir),
+                        str(file_work_dir),
                     ]
                     print(f"Running command: {' '.join(command)}")
 
@@ -122,7 +158,7 @@ def process_audio(input_path: str | Path, session_path: Path, config: DatasetRun
 
             print(f"Converting {file_to_process.name} to WAV format...")
             # Convert to WAV with target sample rate
-            output_file = audio_sources_dir / f"{file_path.stem}.wav"
+            output_file = audio_sources_dir / _build_output_filename(file_path, input_root, used_output_stems)
             convert_to_wav(file_to_process, output_file, config.sample_rate)
             processed_files.append(output_file)
             print(f"Successfully processed {file_path.name} -> {output_file.name}")

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from easy_xtts_trainer.config import DatasetRuntimeConfig
 from easy_xtts_trainer.dataset.parsing import parse_transcription
 
@@ -131,3 +133,64 @@ def test_parse_transcription_skips_processor_when_no_pending_segments(tmp_path: 
 
     assert segments_count == 0
     assert call_count == 0
+
+
+@pytest.mark.parametrize(
+    "sample_method",
+    ["maximise-punctuation", "punctuation-only", "mixed"],
+)
+def test_parse_transcription_methods_do_not_duplicate_words(tmp_path: Path, sample_method: str) -> None:
+    json_file = tmp_path / "sample.json"
+    json_file.write_text(
+        json.dumps(
+            {
+                "word_segments": [
+                    {"word": "Hello", "start": 0.0, "end": 1.0},
+                    {"word": "world.", "start": 1.0, "end": 2.6},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captured_segments: list[dict[str, object]] = []
+
+    class StubProcessor:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def process_segments(
+            self,
+            audio_path: str,
+            segments: list[dict[str, object]],
+            output_dir: Path,
+            dataset_config: DatasetRuntimeConfig,
+        ) -> list[dict[str, str]]:
+            _ = audio_path, output_dir, dataset_config
+            captured_segments.extend(segments)
+            return [
+                {
+                    "audio_file": str(output_dir / "segment_001.wav"),
+                    "text": str(segment["text"]),
+                    "speaker_name": "coqui",
+                }
+                for segment in segments
+            ]
+
+    config = _dataset_config(sample_method=sample_method)
+    session_data = {"qualifying_segments": []}
+    segments_count = parse_transcription(
+        json_file=json_file,
+        audio_file=tmp_path / "audio.wav",
+        processed_dir=tmp_path / "processed",
+        session_data=session_data,
+        dataset_config=config,
+        processor_factory=lambda _: StubProcessor(),
+    )
+
+    assert segments_count == 1
+    assert len(captured_segments) == 1
+    assert captured_segments[0]["text"] == "Hello world."
+    assert len(captured_segments[0]["words"]) == 2
+    assert len(session_data["qualifying_segments"]) == 1
+    assert session_data["qualifying_segments"][0]["text"] == "Hello world."

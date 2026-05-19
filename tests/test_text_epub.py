@@ -31,7 +31,11 @@ def test_prepare_source_text_for_audio_epub_builds_full_source_file(monkeypatch,
     epub_path = tmp_path / "book.epub"
     epub_path.write_bytes(b"epub")
 
+    call_count = 0
+
     def fake_process_epub(self, _: Path) -> None:
+        nonlocal call_count
+        call_count += 1
         self.chapters = ["Chapter one text.", "Chapter two text.", "Chapter three text."]
 
     monkeypatch.setattr("easy_xtts_trainer.text.epub.EpubProcessor.process_epub", fake_process_epub)
@@ -54,3 +58,4 @@ def test_prepare_source_text_for_audio_epub_builds_full_source_file(monkeypatch,
     assert "Chapter one text." in combined_text
     assert "Chapter two text." in combined_text
     assert "Chapter three text." in combined_text
+    assert call_count == 1
