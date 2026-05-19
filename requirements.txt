@@ -1,19 +1,20 @@
 # Core dependencies
-numpy==1.26.4
-torch==2.2.0
-torchaudio==2.2.0
+numpy==2.2.6
+torch==2.8.0
+torchaudio==2.8.0
 scipy==1.15.1
 
 # Audio processing
 pydub==0.25.1
 librosa==0.10.2.post1
 soundfile==0.13.1
-DeepFilterNet==0.5.6
-DeepFilterLib==0.5.6
+# Optional denoise dependencies (install only on supported platforms)
+# DeepFilterNet==0.5.6
+# DeepFilterLib==0.5.6
 
 # TTS related
-coqui-tts==0.25.3
-coqui-tts-trainer==0.2.2
+coqui-tts==0.27.5
+coqui-tts-trainer==0.3.3
 
 # Utilities
 requests==2.32.3
@@ -26,4 +27,8 @@ EbookLib==0.18
 
 # Git repositories
 breath-removal @ git+https://github.com/lukaszliniewicz/breath-removal.git@4f3cda4936ae09ec50af010853577fdd4472fd6a
-ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git@7578992b6647a98e65b539436d88bc7bba690374
+
+# Optional dependency for --source-text alignment.
+# This package builds a C++ extension from source and may require
+# Visual Studio Build Tools on Windows.
+# ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git@7578992b6647a98e65b539436d88bc7bba690374

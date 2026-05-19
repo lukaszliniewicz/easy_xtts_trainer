@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "easy-xtts-trainer"
+version = "0.1.0"
+description = "CLI tool for preparing datasets and training XTTS models"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dynamic = ["dependencies"]
+
+[project.scripts]
+easy-xtts-trainer = "easy_xtts_trainer.cli:main"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["easy_xtts_trainer*"]

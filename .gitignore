@@ -1,0 +1,29 @@
+# Local planning notes
+DECOMPOSITION_PLAN.md
+docs/*plan*.md
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Runtime/generated project artifacts
+base_models/
+xtts-finetune-*/
+session-log--*.txt
+session-data--*.json
+cut_points_debug.log

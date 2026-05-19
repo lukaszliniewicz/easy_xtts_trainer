@@ -1,145 +1,128 @@
-
 # Easy XTTS Trainer
 
-This command-line app simplifies the process of training custom XTTS models. While designed to work seamlessly with [Pandrator](https://github.com/lukaszliniewicz/Pandrator) for a GUI-driven experience, it can also be used standalone.  Pandrator offers immediate model loading, testing, and convenient installers/portable packages that bundle this trainer and its dependencies.
+Easy XTTS Trainer is a CLI for preparing speech datasets and fine-tuning XTTS models.
+It is designed to run inside the Pandrator ecosystem, while still supporting standalone usage.
 
-## Table of Contents
-- [Installation](#installation)
-  - [Setting up Conda Environments](#setting-up-conda-environments)
-  - [Installing the App](#installing-the-app)
-- [System Requirements](#system-requirements)
-- [Usage](#usage)
-  - [Arguments](#arguments)
-- [Segment Methods Explanation](#segment-methods-explanation)
-- [Audio Preprocessing and Refinement](#audio-preprocessing-and-refinement)
+## What is new
 
+- Pixi-first WhisperX runtime (`auto`, `pixi`, `conda`) with legacy Conda fallback.
+- Optional/lazy DeepFilterNet (`--denoise` soft-fails when DeepFilter is not installed).
+- Robust `--source-text` correction flow for full-book `.txt` and `.epub` sources with partial-audio inputs.
+- Python baseline moved to `3.13` with updated Torch/Coqui compatibility pins.
+
+## Requirements
+
+- Windows (primary target) with NVIDIA GPU recommended for training.
+- Python `>=3.13,<3.14`.
+- For source-text alignment: optional `ctc-forced-aligner` build dependencies (MSVC/Build Tools on Windows).
 
 ## Installation
 
-### Setting up Conda Environments
+### Pandrator-first (recommended)
 
-Before installing the app, you need to set up a Conda environment named `xtts_training` for the app itself and `whisperx` for the WhisperX transcription tool.
+Install and launch through Pandrator. Pandrator provides the Pixi environment layout used by this trainer.
 
-**Create the `xtts_training` environment:**
-
-```bash
-conda create --name xtts_training python=3.10
-```
-
-**Create the `whisperx` environment:**
-
-```bash
-conda create --name whisperx python=3.10
-```
-
-**Activate the `whisperx` environment and install WhisperX:**
-
-```bash
-conda activate whisperx
-conda run pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
-conda install cudnn=8.9.7.29 -c conda-forge -y
-pip install git+https://github.com/m-bain/whisperx.git
-conda deactivate
-```
-
-
-### Installing the App
-
-**Clone the repository:**
-
-```bash
-git clone https://github.com/your-repo/xtts-training-app.git
-```
-
-**Activate the `xtts_training` environment:**
-
-```bash
-conda activate xtts_training
-```
-
-**Install the requirements:**
+### Standalone
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**Install PyTorch and Torchaudio:**
-Ensure these versions are compatible with your CUDA setup.
+Optional features:
 
 ```bash
-pip install torch torchaudio
+# Optional: denoise support (only on supported Python/platform wheels)
+pip install DeepFilterNet==0.5.6 DeepFilterLib==0.5.6
+
+# Optional: source-text alignment
+pip install "ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git@7578992b6647a98e65b539436d88bc7bba690374"
 ```
-
-## System Requirements
-
-* Nvidia GPU with at least 8GB of VRAM (11GB recommended for larger models/batch sizes)
-* Python 3.10
-* Conda environments: `xtts_training` and `whisperx`
 
 ## Usage
 
-**Run the app with the `--help` flag to see all options:**
+Run help:
 
 ```bash
-python easy-xtts-trainer.py --help
+python -m easy_xtts_trainer --help
 ```
 
-### Arguments
+Or, if installed as a package:
 
-| Argument | Description | Required | Options/Defaults |
-|---|---|---|---|
-| `--source-language` | Source language for the model. | Yes |  en, es, fr, de, it, pt, pl, tr, ru, nl, cs, ar, zh-cn, ja, ko, hu |
-| `--whisper-model` | Whisper model for transcription. | No | medium, medium.en, large-v2, large-v3 (default: `large-v3`) |
-| `--denoise` | Apply DeepFilterNet noise reduction to audio. | No | False |
-| `--enhance` | Placeholder for future audio enhancement features. Not currently implemented. | No | False (not functional) |
-| `-i`, `--input` | Input folder containing audio files or a single audio file. | Yes | - |
-| `--session` | Name of the output folder for the training session. | No | `xtts-finetune-YYYY-MM-DD-HH-MM` |
-| `--separate` | Placeholder for future speech separation features. Not currently implemented. | No | False (not functional) |
-| `--epochs` | Number of training epochs. | No | 6 |
-| `--xtts-base-model` | XTTS base model version. | No | v2.0.2 |
-| `--batch` | Training batch size. | No | 2 |
-| `--gradient` | Gradient accumulation steps. | No | 1 |
-| `--xtts-model-name` | Name for the trained model. | No | `xtts_model_YYYYMMDD_HHMMSS` |
-| `--sample-method` | Method for segmenting audio and text for training. | No | maximise-punctuation, punctuation-only, mixed (default: `maximise-punctuation`) |
-| `-conda_env` | Name of the Conda environment to use (overrides automatic detection). | No | - |
-| `-conda_path` | Path to the Conda installation (overrides automatic detection). | No | - |
-| `--sample-rate` | Sample rate for audio. | No | 22050, 44100 (default: 22050) |
-| `--max-audio-time` | Maximum audio segment duration in seconds. | No | 11 |
-| `--max-text-length` | Maximum text segment length in characters. | No | 200 |
-| `--align-model` | Model used for phoneme alignment during transcription (for WhisperX).  | No | -  |
-| `--normalize` | Normalize audio to target LUFS. | No | -16.0 (if flag is used without a value) |
-| `--dess` | Apply de-essing to audio. | No | False |
-| `--compress` | Apply dynamic range compression. | No | male, female, neutral |
-| `--method-proportion` | Proportion of `maximise-punctuation` to `punctuation-only` when using `mixed` sample method. Format: `N_M` where N+M=10 (e.g., `6_4` for 60/40 split). | No | 6_4 (60% maximise, 40% punctuation) |
-| `--training-proportion` | Proportion of data for training vs. validation. Format: `N_M` where N+M=10 (e.g., `8_2` for 80/20 split). | No | 8_2 (80% train, 20% validation) |
+```bash
+easy-xtts-trainer --help
+```
 
+Example:
 
+```bash
+python -m easy_xtts_trainer \
+  --source-language en \
+  --input "D:\\audiobook" \
+  --session "xtts-finetune-mybook" \
+  --sample-method mixed \
+  --method-proportion 6_4
+```
 
-## Segment Methods Explanation
+## WhisperX runtime modes
 
-The app employs these methods to prepare training segments:
+`--whisperx-runner` controls transcription execution:
 
-* **`maximise-punctuation`**:  Prioritizes creating longer segments within the `--max-audio-time` (default 11 seconds) and `--max-text-length` (default 200 characters) limits. Segments are split at sentence-ending or clause-ending punctuation marks (`.!?;,-`). This method aims for fewer, longer segments, potentially capturing more context.
+- `auto` (default):
+  1. explicit CLI Pixi args,
+  2. `WHISPERX_PIXI_EXE` + `WHISPERX_PIXI_MANIFEST`,
+  3. Pandrator layout discovery (`bin/pixi.exe` + `envs/whisperx_installer/pixi.toml`),
+  4. Conda fallback.
+- `pixi`: require Pixi runtime.
+- `conda`: use Conda flow only.
 
-* **`punctuation-only`**: Segments are strictly split at every sentence-ending or clause-ending punctuation mark, regardless of the resulting segment length. This can create many shorter segments.
+Related options:
 
-* **`mixed`**: Combines both methods. The `--method-proportion` argument (default `6_4`) controls the ratio. For example, `6_4` means 60% of the audio duration will be segmented using `maximise-punctuation` and 40% using `punctuation-only`.
+- `--whisperx-pixi-exe`
+- `--whisperx-pixi-manifest`
+- legacy fallback options: `-conda_env`, `-conda_path`
 
+## Source-text correction (`--source-text`)
 
-## Audio Preprocessing and Refinement
+When source text is provided, the pipeline is:
 
-The app now integrates audio preprocessing steps to improve training data quality. These options can be used individually or combined:
+1. Run WhisperX baseline transcription.
+2. Build query words from Whisper output.
+3. Retrieve top text candidates from the full source (works with whole-book `.txt`/`.epub`).
+4. Validate candidates with CTC alignment.
+5. Keep the best candidate only when confidence is high; otherwise keep WhisperX output.
 
-* **`--normalize <target_lufs>`**: Normalizes audio to a target LUFS value (Loudness Unit Full Scale). This helps ensure consistent loudness across training samples. The default target is -16.0 LUFS if the flag is used without specifying a value.
-* **`--dess`**: Applies de-essing to reduce harsh sibilant sounds ("s", "sh", "ch").
-* **`--denoise`**: Uses DeepFilterNet for noise reduction.
-* **`--compress <profile>`**: Applies dynamic range compression using profiles optimized for `male`, `female`, or `neutral` voices. This reduces the difference between the loudest and quietest parts of the audio.
-* **`--sample-rate <rate>`**: Sets the target sample rate for audio.  Default is 22050 Hz, which is recommended for XTTS.  Optionally use 44100 Hz.
+This prevents destructive over-correction while still improving proper nouns and wording when good source context exists.
 
+## Key CLI arguments
 
-**Segment Refinement:**
+| Argument | Description | Default |
+|---|---|---|
+| `--source-language` | Source language code for transcription/training | required |
+| `--input` | Input folder or single audio file | optional when reusing session |
+| `--session` | Session folder name/path | `xtts-finetune-YYYY-MM-DD-HH-MM` |
+| `--whisper-model` | Whisper model | `large-v3` |
+| `--whisperx-runner` | WhisperX runtime mode (`auto`, `pixi`, `conda`) | `auto` |
+| `--source-text` | `.txt` or `.epub` source text for correction/alignment | off |
+| `--chapter-per-audio` | EPUB chapter grouping size before full-source merge | `1` |
+| `--sample-method` | Segmentation strategy (`maximise-punctuation`, `punctuation-only`, `mixed`) | `maximise-punctuation` |
+| `--method-proportion` | Mixed segmentation split (`N_M`) | `6_4` |
+| `--training-proportion` | Train/validation split (`N_M`) | `8_2` |
+| `--max-audio-time` | Max segment duration (seconds) | `11` |
+| `--max-text-length` | Max segment text length (chars) | `200` |
+| `--denoise` | Enable DeepFilterNet denoise (optional dependency) | off |
+| `--dess` | De-esser | off |
+| `--normalize` | Target LUFS normalization | unset (or `-16.0` when flag is used without value) |
+| `--compress` | Compression profile (`male`, `female`, `neutral`) | off |
+| `--prepare_dataset` | Prepare dataset only, skip training | off |
 
-To minimize crossovers between segments and create clean transitions, the app refines the segment boundaries by analyzing the audio *between* adjacent segments:
+## Testing
 
-1. **Boundary Zone:**  The app identifies the boundary zone between the end of one segment and the beginning of the next. This zone is determined by the timestamps of the last word in the preceding segment and the first word in the following segment. A small amount of padding (up to 200ms) is added to either side of this zone if the adjacent words do not have valid timestamp information.
-2. **Lowest Energy Point:** Within this boundary zone, the app searches for the point with the lowest RMS energy (the quietest point), using 2ms windows for analysis with 1ms overlap. This dynamic approach helps find the optimal cut point, even if the WhisperX timestamps weren't perfect.
+```bash
+python -m pytest
+```
+
+## Notes
+
+- `ctc-forced-aligner` is optional by design.
+- If DeepFilter is unavailable, `--denoise` prints a warning and processing continues.
+- For Pandrator installations, prefer leaving WhisperX runner mode on `auto`.
