@@ -6,7 +6,7 @@ scipy==1.15.1
 
 # Audio processing
 pydub==0.25.1
-librosa==0.10.2.post1
+librosa==0.11.0
 soundfile==0.13.1
 # Optional denoise dependencies (install only on supported platforms)
 # DeepFilterNet==0.5.6
@@ -29,6 +29,9 @@ EbookLib==0.18
 breath-removal @ git+https://github.com/lukaszliniewicz/breath-removal.git@4f3cda4936ae09ec50af010853577fdd4472fd6a
 
 # Optional dependency for --source-text alignment.
-# This package builds a C++ extension from source and may require
-# Visual Studio Build Tools on Windows.
-# ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git@7578992b6647a98e65b539436d88bc7bba690374
+# Runtime prerequisite: ffmpeg executable must be available on PATH.
+# Prefer the vendored wheel on Windows/Python 3.13:
+# pip install ./vendor/ctc_forced_aligner-0.3.0-cp313-cp313-win_amd64.whl
+# Fallback (builds C++ extension from source; may require Visual Studio Build Tools):
+# ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git@264e7a1f81bff9ff5e787a5537020c2ad0b0df02
+# Note: ctc-forced-aligner>=1.0 on PyPI is a different package and is not used here.

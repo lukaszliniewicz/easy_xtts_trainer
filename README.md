@@ -14,7 +14,7 @@ It is designed to run inside the Pandrator ecosystem, while still supporting sta
 
 - Windows (primary target) with NVIDIA GPU recommended for training.
 - Python `>=3.13,<3.14`.
-- For source-text alignment: optional `ctc-forced-aligner` build dependencies (MSVC/Build Tools on Windows).
+- For source-text alignment: optional `ctc-forced-aligner` dependencies (ffmpeg on `PATH`; MSVC/Build Tools if building from source on Windows).
 
 ## Installation
 
@@ -34,8 +34,11 @@ Optional features:
 # Optional: denoise support (only on supported Python/platform wheels)
 pip install DeepFilterNet==0.5.6 DeepFilterLib==0.5.6
 
-# Optional: source-text alignment
-pip install "ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git@7578992b6647a98e65b539436d88bc7bba690374"
+# Optional: source-text alignment (requires ffmpeg on PATH; prefer vendored prebuilt wheel)
+pip install ./vendor/ctc_forced_aligner-0.3.0-cp313-cp313-win_amd64.whl
+
+# Optional fallback: build latest MahmoudAshraf97 source from Git
+pip install "ctc-forced-aligner @ git+https://github.com/MahmoudAshraf97/ctc-forced-aligner.git@264e7a1f81bff9ff5e787a5537020c2ad0b0df02"
 ```
 
 ## Usage
