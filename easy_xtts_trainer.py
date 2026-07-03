@@ -361,7 +361,22 @@ def get_dataset_size(train_csv: str) -> int:
         return 0
 
 
-def _peek_first_audio_path(metadata_csv_path: Path) -> Optional[Path]:
+def _resolve_metadata_audio_path(raw_audio_path: str, metadata_csv_path: Path, dataset_root: Path | None = None) -> Path:
+    audio_path = Path(raw_audio_path)
+    if audio_path.is_absolute():
+        return audio_path.resolve()
+
+    candidates = []
+    if dataset_root is not None:
+        candidates.append((dataset_root / audio_path).resolve())
+    if metadata_csv_path.parent.name.lower() == "databases":
+        candidates.append((metadata_csv_path.parent.parent / audio_path).resolve())
+    candidates.append((metadata_csv_path.parent / audio_path).resolve())
+
+    return next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+
+
+def _peek_first_audio_path(metadata_csv_path: Path, dataset_root: Path | None = None) -> Optional[Path]:
     """Read the first audio path from a metadata CSV file."""
     try:
         with open(metadata_csv_path, 'r', encoding='utf-8', newline='') as handle:
@@ -371,10 +386,7 @@ def _peek_first_audio_path(metadata_csv_path: Path) -> Optional[Path]:
                 if not raw_audio_path:
                     continue
 
-                audio_path = Path(raw_audio_path)
-                if not audio_path.is_absolute():
-                    audio_path = (metadata_csv_path.parent / audio_path).resolve()
-                return audio_path
+                return _resolve_metadata_audio_path(raw_audio_path, metadata_csv_path, dataset_root)
     except Exception:
         return None
 
@@ -392,7 +404,7 @@ def _build_dataset_config_paths(train_csv: str, eval_csv: str) -> tuple[Path, st
     else:
         dataset_root = train_csv_path.parent
 
-    first_audio_path = _peek_first_audio_path(train_csv_path) or _peek_first_audio_path(eval_csv_path)
+    first_audio_path = _peek_first_audio_path(train_csv_path, dataset_root) or _peek_first_audio_path(eval_csv_path, dataset_root)
     if first_audio_path is not None:
         try:
             first_audio_path.relative_to(dataset_root)

@@ -36,6 +36,19 @@ class PipelineHooks:
     copy_reference_samples: Callable[[Path, Path, dict, VoiceSampleRuntimeConfig], None]
 
 
+def _resolve_session_audio_path(raw_audio_path: str, session_path: Path, metadata_csv_path: Path) -> Path:
+    audio_path = Path(raw_audio_path)
+    if audio_path.is_absolute():
+        return audio_path
+
+    candidates = [
+        session_path / audio_path,
+        session_path / "audio_sources" / "processed" / audio_path.name,
+        metadata_csv_path.parent / audio_path,
+    ]
+    return next((candidate.resolve() for candidate in candidates if candidate.exists()), candidates[0].resolve())
+
+
 def run_training_pipeline(
     args: Any,
     transcription_config: TranscriptionRuntimeConfig,
@@ -114,7 +127,7 @@ def run_training_pipeline(
                         next(reader)  # Skip header
                         for row in reader:
                             if len(row) >= 3:
-                                audio_file = Path(row[0])
+                                audio_file = _resolve_session_audio_path(row[0], session_path, train_csv_path)
                                 if not audio_file.exists():
                                     logger.warning(f"Audio file not found: {audio_file}")
                                     continue

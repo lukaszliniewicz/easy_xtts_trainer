@@ -69,9 +69,17 @@ def update_csv_paths(csv_file: Path, old_session: Path, new_session: Path) -> bo
                 parts = line.split("|")
                 if len(parts) >= 3:
                     try:
-                        old_path = Path(parts[0]).resolve()
+                        raw_path = Path(parts[0])
                         old_session_abs = old_session.resolve()
                         new_session_abs = new_session.resolve()
+                        if raw_path.is_absolute():
+                            old_path = raw_path.resolve()
+                        else:
+                            candidates = [
+                                (old_session_abs / raw_path).resolve(),
+                                (old_session_abs / "audio_sources" / "processed" / raw_path.name).resolve(),
+                            ]
+                            old_path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
 
                         if str(old_session_abs) in str(old_path):
                             rel_path = old_path.relative_to(old_session_abs)

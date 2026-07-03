@@ -55,3 +55,21 @@ def test_copy_session_files_copies_audio_and_updates_csv(tmp_path: Path) -> None
     assert copied_csv.exists()
     assert copied_wav.exists()
     assert str(dst_session.resolve()) in copied_csv.read_text(encoding="utf-8")
+
+
+def test_copy_session_files_accepts_exported_relative_audio_paths(tmp_path: Path) -> None:
+    src_session = _create_reusable_session(tmp_path, session_name="relative_src")
+    relative_row = "audio_sources/processed/sample.wav|hello|001\n"
+    for csv_path in (src_session / "databases").glob("*_metadata.csv"):
+        csv_path.write_text("audio_file|text|speaker_name\n" + relative_row, encoding="utf-8")
+
+    dst_session = tmp_path / "relative_dst"
+
+    assert copy_session_files(src_session, dst_session) is True
+
+    copied_csv = dst_session / "databases" / "train_metadata.csv"
+    copied_wav = dst_session / "audio_sources" / "processed" / "sample.wav"
+
+    assert copied_wav.exists()
+    copied_text = copied_csv.read_text(encoding="utf-8")
+    assert str(copied_wav.resolve()) in copied_text
